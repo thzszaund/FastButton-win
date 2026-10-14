@@ -22,6 +22,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
 #define MAXE 400
@@ -43,6 +44,7 @@ typedef struct MonBtn {
     int hidden, alive, drag, hover, skipUp;
     POINT dp, wo;
     HWND saved[128];
+    unsigned char savedMax[128];
     int nsaved;
 } MonBtn;
 
@@ -59,11 +61,12 @@ static int g_nmb;
 static Entry g_e[MAXE];
 static int g_n;
 static Act g_click, g_dbl, g_mid;
-static struct { int size, opacity, hover, shape, localKeys; COLORREF color; wchar_t icon[MAX_PATH]; } g_cfg;
+static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop; COLORREF color; wchar_t icon[MAX_PATH]; } g_cfg;
 static wchar_t g_excl[MAXLIST][64], g_remote[MAXLIST][64];
 static int g_nexcl, g_nremote;
 static HICON g_icon;
-static int g_inMenu, g_modal;
+static int g_inMenu, g_modal, g_debug;
+static wchar_t g_log[MAX_PATH];
 static HWND g_prevFg, g_lastFg;
 static int g_lastFgEx;
 
@@ -98,6 +101,40 @@ static COLORREF ParseColor(const wchar_t *s, COLORREF def) {
     return RGB((v >> 16) & 255, (v >> 8) & 255, v & 255);
 }
 static int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+/* журнал диагностики (UTF-16, CornerBtn.log рядом с программой) */
+static void Log(const wchar_t *fmt, ...) {
+    if (!g_debug || !g_log[0]) return;
+    wchar_t msg[1000], line[1100];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnwprintf(msg, 999, fmt, ap);
+    va_end(ap);
+    msg[999] = 0;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    _snwprintf(line, 1100, L"%02d:%02d:%02d.%03d  %ls\r\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+    line[1099] = 0;
+    HANDLE h = CreateFileW(g_log, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    if (GetLastError() != ERROR_ALREADY_EXISTS) { WORD bom = 0xFEFF; WriteFile(h, &bom, 2, &w, NULL); }
+    WriteFile(h, line, (DWORD)(wcslen(line) * sizeof(wchar_t)), &w, NULL);
+    CloseHandle(h);
+}
+static void WinBuild(wchar_t *out, int n) {
+    HKEY k;
+    wchar_t b[64] = L"?", v[64] = L"";
+    DWORD sz, ubr = 0;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", 0, KEY_READ | KEY_WOW64_64KEY, &k) == ERROR_SUCCESS) {
+        sz = sizeof b; RegQueryValueExW(k, L"CurrentBuildNumber", NULL, NULL, (BYTE *)b, &sz);
+        sz = sizeof v; if (RegQueryValueExW(k, L"DisplayVersion", NULL, NULL, (BYTE *)v, &sz) != ERROR_SUCCESS) { sz = sizeof v; RegQueryValueExW(k, L"ReleaseId", NULL, NULL, (BYTE *)v, &sz); }
+        sz = sizeof ubr; RegQueryValueExW(k, L"UBR", NULL, NULL, (BYTE *)&ubr, &sz);
+        RegCloseKey(k);
+    }
+    _snwprintf(out, (size_t)n, L"Windows: сборка %ls.%lu %ls", b, (unsigned long)ubr, v);
+    out[n - 1] = 0;
+}
 
 /* ---------- ini ---------- */
 static int EnsureIni(void) { /* 1 если файл только что создан */
@@ -198,6 +235,10 @@ static void LoadAll(void) {
     g_cfg.hover = Clamp(GetI(L"Button", L"HoverOpacity", 90), 5, 100);
     g_cfg.shape = GetI(L"Button", L"Shape", 0) ? 1 : 0;
     g_cfg.localKeys = GetI(L"Options", L"LocalKeys", 1) ? 1 : 0;
+    g_cfg.pinTop = GetI(L"Options", L"PinTopmost", 1) ? 1 : 0;
+    g_cfg.pinAll = GetI(L"Options", L"PinAllDesktops", 1) ? 1 : 0;
+    g_cfg.keepTop = GetI(L"Options", L"KeepTopmost", 0) ? 1 : 0;
+    g_debug = GetI(L"Options", L"Debug", 0) ? 1 : 0;
     GetS(L"Button", L"Color", L"3399FF", b, 64);
     g_cfg.color = ParseColor(b, RGB(0x33, 0x99, 0xFF));
     GetS(L"Button", L"Icon", L"", g_cfg.icon, MAX_PATH);
@@ -256,6 +297,10 @@ static void SaveCfg(void) {
     PutS(L"Button", L"Color", b);
     PutS(L"Button", L"Icon", g_cfg.icon);
     PutI(L"Options", L"LocalKeys", g_cfg.localKeys);
+    PutI(L"Options", L"PinTopmost", g_cfg.pinTop);
+    PutI(L"Options", L"PinAllDesktops", g_cfg.pinAll);
+    PutI(L"Options", L"KeepTopmost", g_cfg.keepTop);
+    PutI(L"Options", L"Debug", g_debug);
 }
 static void SaveMenu(void) {
     WritePrivateProfileStringW(L"Menu", NULL, NULL, g_ini); /* удалить секцию */
@@ -358,6 +403,36 @@ static int BadClass(HWND w) {
     GetClassNameW(w, c, 64);
     return !wcscmp(c, L"Shell_TrayWnd") || !wcscmp(c, L"Shell_SecondaryTrayWnd") || !wcscmp(c, L"Progman") || !wcscmp(c, L"WorkerW");
 }
+static void DescWin(HWND w, wchar_t *out, int n) {
+    wchar_t cls[64] = L"", title[48] = L"", exe[MAX_PATH] = L"";
+    GetClassNameW(w, cls, 64);
+    GetWindowTextW(w, title, 48);
+    ExeOf(w, exe, MAX_PATH);
+    DWORD cl = 0;
+    DwmGetWindowAttribute(w, 13 /* DWMWA_CLOAKED */, &cl, sizeof cl);
+    _snwprintf(out, (size_t)n, L"hwnd=%p exe=%ls class=%ls cloaked=%lu title=\"%ls\"", (void *)w, exe, cls, (unsigned long)cl, title);
+    out[n - 1] = 0;
+}
+
+/* IVirtualDesktopManager (документированный): принадлежит ли окно текущему виртуальному рабочему столу */
+static const GUID G_ClsidVDM = { 0xAA509086, 0x5CA9, 0x4C25, { 0x8F, 0x95, 0x58, 0x9D, 0x3C, 0x07, 0xB4, 0x8B } };
+static const GUID G_IidVDM   = { 0xA5CD92FF, 0x29BE, 0x454C, { 0x8D, 0x04, 0xD8, 0x28, 0x79, 0xFB, 0x3F, 0x1B } };
+typedef struct {
+    HRESULT (STDMETHODCALLTYPE *QI)(void *, REFIID, void **);
+    ULONG (STDMETHODCALLTYPE *AddRef)(void *);
+    ULONG (STDMETHODCALLTYPE *Release)(void *);
+    HRESULT (STDMETHODCALLTYPE *IsWindowOnCurrentVirtualDesktop)(void *, HWND, BOOL *);
+    void *GetWindowDesktopId, *MoveWindowToDesktop;
+} VDMVtbl;
+typedef struct { VDMVtbl *v; } VDM;
+static VDM *g_vdm;
+static int OnCurDesk(HWND w) {
+    BOOL on = TRUE;
+    if (!g_vdm) return 1;
+    if (FAILED(g_vdm->v->IsWindowOnCurrentVirtualDesktop(g_vdm, w, &on))) return 1;
+    return on ? 1 : 0;
+}
+
 static HWND FgTarget(void) { /* активное окно "до нас" */
     HWND f = GetForegroundWindow();
     if (!f || IsOurs(f)) f = g_prevFg;
@@ -370,11 +445,12 @@ static BOOL Candidate(HWND w) {
     LONG st = GetWindowLongW(w, GWL_STYLE), ex = GetWindowLongW(w, GWL_EXSTYLE);
     if (!(st & WS_MINIMIZEBOX)) return FALSE;
     if (ex & WS_EX_TOOLWINDOW) return FALSE;
-    if (ex & WS_EX_TOPMOST) return FALSE; /* закреплённые окна остаются на месте */
+    if ((ex & WS_EX_TOPMOST) && g_cfg.keepTop) return FALSE; /* по настройке: окна "поверх всех" не трогаем */
     if (GetWindow(w, GW_OWNER) && !(ex & WS_EX_APPWINDOW)) return FALSE;
     DWORD cloaked = 0;
     if (SUCCEEDED(DwmGetWindowAttribute(w, 13 /* DWMWA_CLOAKED */, &cloaked, sizeof cloaked)) && cloaked) return FALSE; /* другой рабочий стол */
     if (IsOurs(w) || BadClass(w)) return FALSE;
+    if (!OnCurDesk(w)) return FALSE; /* окно другого рабочего стола */
     return TRUE;
 }
 typedef struct { HMONITOR mon; HWND *out; int n, max; } EW;
@@ -386,13 +462,25 @@ static BOOL CALLBACK EnumMin(HWND w, LPARAM l) {
     e->out[e->n++] = w;
     return TRUE;
 }
+static void RestoreWin(HWND w, int wasMax) {
+    ShowWindow(w, SW_SHOWNOACTIVATE); /* без активации: не вызывает переключение рабочего стола */
+    if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
+    if (wasMax && !IsZoomed(w)) ShowWindow(w, SW_SHOWMAXIMIZED);
+}
 static void MonDeskToggle(MonBtn *b) {
+    wchar_t d[700];
     if (!b) return;
     if (b->nsaved) {
         int any = 0;
+        Log(L"[%ls] восстановление, запомнено окон: %d", b->dev, b->nsaved);
         for (int i = b->nsaved - 1; i >= 0; i--) {
             HWND w = b->saved[i];
-            if (IsWindow(w) && IsIconic(w)) { ShowWindow(w, SW_RESTORE); any = 1; }
+            if (!IsWindow(w) || !IsIconic(w)) continue;
+            int on = OnCurDesk(w);
+            if (g_debug) { DescWin(w, d, 700); Log(L"  restore onCurrentDesktop=%d %ls", on, d); }
+            if (!on) continue;
+            RestoreWin(w, b->savedMax[i]);
+            any = 1;
         }
         b->nsaved = 0;
         if (any) return;
@@ -400,7 +488,12 @@ static void MonDeskToggle(MonBtn *b) {
     EW e = { b->mon, b->saved, 0, 128 };
     EnumWindows(EnumMin, (LPARAM)&e);
     b->nsaved = e.n;
-    for (int i = 0; i < e.n; i++) ShowWindow(b->saved[i], SW_SHOWMINNOACTIVE);
+    Log(L"[%ls] сворачивание, окон: %d", b->dev, e.n);
+    for (int i = 0; i < e.n; i++) {
+        b->savedMax[i] = IsZoomed(b->saved[i]) ? 1 : 0;
+        if (g_debug) { DescWin(b->saved[i], d, 700); Log(L"  minimize max=%d %ls", b->savedMax[i], d); }
+        ShowWindow(b->saved[i], SW_SHOWMINNOACTIVE);
+    }
 }
 
 /* оболочка Windows через COM: работает локально и не зависит от того, куда идут клавиши */
@@ -470,25 +563,59 @@ typedef struct {
 } PAVtbl;
 typedef struct { PAVtbl *v; } PA;
 
-static int PinWin(HWND w, int pin) {
+static const GUID G_IidView = { 0x372E1D3B, 0x38D3, 0x42E4, { 0xA1, 0x5B, 0x8A, 0xB2, 0xB1, 0x78, 0xF5, 0x13 } };
+static void SetErr(wchar_t *err, int en, const wchar_t *step, HRESULT hr) {
+    if (!err) return;
+    _snwprintf(err, (size_t)en, L"%ls: HRESULT 0x%08lX", step, (unsigned long)hr);
+    err[en - 1] = 0;
+}
+/* op: 0 открепить, 1 закрепить, 2 спросить (1 = закреплено, 0 = нет); при ошибке -1 и текст в err */
+static int PinWin(HWND w, int op, wchar_t *err, int en) {
     IServiceProvider *sp = NULL;
     AVC *coll = NULL;
     PA *pa = NULL;
-    void *view = NULL;
-    int ok = 0;
-    if (FAILED(CoCreateInstance(&G_ImmersiveShell, NULL, CLSCTX_LOCAL_SERVER, &IID_IServiceProvider, (void **)&sp)) || !sp) return 0;
-    if (SUCCEEDED(sp->lpVtbl->QueryService(sp, &G_IidViewColl, &G_IidViewColl, (void **)&coll)) && coll &&
-        SUCCEEDED(sp->lpVtbl->QueryService(sp, &G_SidPinned, &G_IidPinned, (void **)&pa)) && pa) {
-        if (SUCCEEDED(coll->v->GetViewForHwnd(coll, w, &view)) && view) {
-            HRESULT hr = pin ? pa->v->PinView(pa, view) : pa->v->UnpinView(pa, view);
-            ok = SUCCEEDED(hr);
-            ((IUnknown *)view)->lpVtbl->Release((IUnknown *)view);
-        }
-    }
+    void *view = NULL, *view2 = NULL, *v = NULL;
+    int res = -1;
+    BOOL pinned = FALSE;
+    HRESULT hr;
+    if (err) err[0] = 0;
+    hr = CoCreateInstance(&G_ImmersiveShell, NULL, CLSCTX_LOCAL_SERVER, &IID_IServiceProvider, (void **)&sp);
+    Log(L"pin op=%d hwnd=%p: ImmersiveShell hr=0x%08lX", op, (void *)w, (unsigned long)hr);
+    if (FAILED(hr) || !sp) { SetErr(err, en, L"шаг 1 (оболочка Windows)", hr); return -1; }
+    hr = sp->lpVtbl->QueryService(sp, &G_IidViewColl, &G_IidViewColl, (void **)&coll);
+    Log(L"pin: ApplicationViewCollection hr=0x%08lX", (unsigned long)hr);
+    if (FAILED(hr) || !coll) { SetErr(err, en, L"шаг 2 (список окон)", hr); goto done; }
+    hr = sp->lpVtbl->QueryService(sp, &G_SidPinned, &G_IidPinned, (void **)&pa);
+    Log(L"pin: VirtualDesktopPinnedApps hr=0x%08lX", (unsigned long)hr);
+    if (FAILED(hr) || !pa) { SetErr(err, en, L"шаг 3 (закрепление)", hr); goto done; }
+    hr = coll->v->GetViewForHwnd(coll, w, &view);
+    Log(L"pin: GetViewForHwnd hr=0x%08lX view=%p", (unsigned long)hr, view);
+    if (FAILED(hr) || !view) { SetErr(err, en, L"шаг 4 (окно в списке)", FAILED(hr) ? hr : E_POINTER); goto done; }
+    hr = ((IUnknown *)view)->lpVtbl->QueryInterface((IUnknown *)view, &G_IidView, &view2);
+    Log(L"pin: QueryInterface(IApplicationView) hr=0x%08lX", (unsigned long)hr);
+    v = (SUCCEEDED(hr) && view2) ? view2 : view;
+    hr = pa->v->IsViewPinned(pa, v, &pinned);
+    Log(L"pin: IsViewPinned hr=0x%08lX pinned=%d", (unsigned long)hr, (int)pinned);
+    if (FAILED(hr)) { SetErr(err, en, L"шаг 5 (проверка закрепления)", hr); goto done; }
+    if (op == 2) { res = pinned ? 1 : 0; goto done; }
+    hr = S_OK;
+    if (op == 1 && !pinned) hr = pa->v->PinView(pa, v);
+    else if (op == 0 && pinned) hr = pa->v->UnpinView(pa, v);
+    Log(L"pin: Pin/UnpinView hr=0x%08lX", (unsigned long)hr);
+    if (FAILED(hr)) { SetErr(err, en, op ? L"шаг 6 (закрепить)" : L"шаг 6 (открепить)", hr); goto done; }
+    res = 1;
+done:
+    if (view2) ((IUnknown *)view2)->lpVtbl->Release((IUnknown *)view2);
+    if (view) ((IUnknown *)view)->lpVtbl->Release((IUnknown *)view);
     if (pa) pa->v->Release(pa);
     if (coll) coll->v->Release(coll);
-    sp->lpVtbl->Release(sp);
-    return ok;
+    if (sp) sp->lpVtbl->Release(sp);
+    return res;
+}
+static int IsPinned(HWND w) {
+    if (GetWindowLongW(w, GWL_EXSTYLE) & WS_EX_TOPMOST) return 1;
+    if (g_cfg.pinAll && PinWin(w, 2, NULL, 0) == 1) return 1;
+    return 0;
 }
 static void PinToggle(HWND w) {
     if (w) w = GetAncestor(w, GA_ROOT);
@@ -496,14 +623,27 @@ static void PinToggle(HWND w) {
         MessageBoxW(NULL, L"Нет подходящего активного окна.", APPNAME, MB_ICONINFORMATION);
         return;
     }
-    LONG ex = GetWindowLongW(w, GWL_EXSTYLE);
-    if (!(ex & WS_EX_TOPMOST)) {
-        SetWindowPos(w, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        if (!PinWin(w, 1))
-            MessageBoxW(NULL, L"Окно закреплено поверх всех, но закрепить его на всех рабочих столах не удалось\n(недокументированный интерфейс Windows).", APPNAME, MB_ICONWARNING);
+    if (!g_cfg.pinTop && !g_cfg.pinAll) {
+        MessageBoxW(NULL, L"В настройках отключены оба режима закрепления.\nВключите хотя бы один: Настройки → Закрепление окна.", APPNAME, MB_ICONINFORMATION);
+        return;
+    }
+    if (!IsPinned(w)) {
+        int ok = 1;
+        wchar_t err[300] = L"", build[120], msg[900];
+        if (g_cfg.pinAll) ok = (PinWin(w, 1, err, 300) == 1);
+        if (ok) {
+            if (g_cfg.pinTop) SetWindowPos(w, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        } else {
+            WinBuild(build, 120);
+            _snwprintf(msg, 900, L"Не удалось закрепить окно на всех рабочих столах.\n\n%ls\n%ls\n\n"
+                       L"Окно не изменено. Закреплять только «поверх всех окон» можно так: Настройки → Закрепление окна → снять галочку «На всех рабочих столах».",
+                       err, build);
+            msg[899] = 0;
+            MessageBoxW(NULL, msg, APPNAME, MB_ICONWARNING);
+        }
     } else {
-        SetWindowPos(w, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        PinWin(w, 0);
+        if (GetWindowLongW(w, GWL_EXSTYLE) & WS_EX_TOPMOST) SetWindowPos(w, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        PinWin(w, 0, NULL, 0);
     }
 }
 
@@ -1221,7 +1361,7 @@ static void ShowEditor(void) {
 
 /* ---------- меню ---------- */
 enum { ID_APPEAR = 100, ID_CLICK, ID_DBL, ID_MID, ID_EDITMENU, ID_AUTORUN, ID_OPENINI, ID_RELOAD, ID_EXIT,
-       ID_PIN, ID_EXCL, ID_REMOTE, ID_LOCALKEYS, ID_CUSTOM = 1000, ID_MON = 2000 };
+       ID_PIN, ID_EXCL, ID_REMOTE, ID_LOCALKEYS, ID_PINTOP, ID_PINALL, ID_KEEPTOP, ID_DEBUG, ID_COPYLOG, ID_CUSTOM = 1000, ID_MON = 2000 };
 
 static int BuildSub(HMENU m, int *i, int depth) {
     int count = 0;
@@ -1239,6 +1379,37 @@ static int BuildSub(HMENU m, int *i, int depth) {
         } else { AppendMenuW(m, MF_STRING, ID_CUSTOM + *i, e->name); (*i)++; count++; }
     }
     return count;
+}
+static void LogStartup(void) {
+    wchar_t bld[120];
+    WinBuild(bld, 120);
+    Log(L"=== CornerBtn: журнал включён. %ls. VirtualDesktopManager: %ls", bld, g_vdm ? L"да" : L"НЕТ");
+    for (int i = 0; i < g_nmb; i++)
+        Log(L"  монитор %d: %ls %ld,%ld..%ld,%ld основной=%d включён=%d угол=%d dx=%d dy=%d", i + 1, g_mb[i]->dev,
+            g_mb[i]->rc.left, g_mb[i]->rc.top, g_mb[i]->rc.right, g_mb[i]->rc.bottom, g_mb[i]->primary, g_mb[i]->enabled, g_mb[i]->corner, g_mb[i]->dx, g_mb[i]->dy);
+}
+static void CopyLog(void) {
+    HANDLE h = CreateFileW(g_log, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) { MessageBoxW(NULL, L"Журнал пуст. Включите его, повторите действие и скопируйте снова.", APPNAME, MB_ICONINFORMATION); return; }
+    DWORD sz = GetFileSize(h, NULL), rd = 0, skip = 0;
+    if (sz > 60000) { SetFilePointer(h, (LONG)(sz - 60000), NULL, FILE_END); sz = 60000; }
+    BYTE *buf = (BYTE *)malloc(sz + 4);
+    if (!buf) { CloseHandle(h); return; }
+    ReadFile(h, buf, sz, &rd, NULL);
+    CloseHandle(h);
+    if (rd >= 2 && buf[0] == 0xFF && buf[1] == 0xFE) skip = 2;
+    rd &= ~1u;
+    HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, rd - skip + 2);
+    if (g) {
+        BYTE *p = (BYTE *)GlobalLock(g);
+        memcpy(p, buf + skip, rd - skip);
+        p[rd - skip] = 0; p[rd - skip + 1] = 0;
+        GlobalUnlock(g);
+        if (OpenClipboard(g_ctl)) { EmptyClipboard(); SetClipboardData(CF_UNICODETEXT, g); CloseClipboard(); }
+        else GlobalFree(g);
+    }
+    free(buf);
+    MessageBoxW(NULL, L"Журнал скопирован в буфер обмена. Вставьте его (Ctrl+V) в чат.", APPNAME, MB_ICONINFORMATION);
 }
 static void HandleCmd(int cmd, MonBtn *b) {
     if (cmd >= ID_CUSTOM && cmd < ID_CUSTOM + g_n) { RunSpec(g_e[cmd - ID_CUSTOM].action, g_e[cmd - ID_CUSTOM].args, b); return; }
@@ -1281,6 +1452,11 @@ static void HandleCmd(int cmd, MonBtn *b) {
                      g_remote, &g_nremote)) SaveList(L"Remote", g_remote, g_nremote);
         break;
     case ID_LOCALKEYS: g_cfg.localKeys = !g_cfg.localKeys; PutI(L"Options", L"LocalKeys", g_cfg.localKeys); break;
+    case ID_PINTOP: g_cfg.pinTop = !g_cfg.pinTop; PutI(L"Options", L"PinTopmost", g_cfg.pinTop); break;
+    case ID_PINALL: g_cfg.pinAll = !g_cfg.pinAll; PutI(L"Options", L"PinAllDesktops", g_cfg.pinAll); break;
+    case ID_KEEPTOP: g_cfg.keepTop = !g_cfg.keepTop; PutI(L"Options", L"KeepTopmost", g_cfg.keepTop); break;
+    case ID_DEBUG: g_debug = !g_debug; PutI(L"Options", L"Debug", g_debug); if (g_debug) LogStartup(); break;
+    case ID_COPYLOG: CopyLog(); break;
     case ID_AUTORUN: AutoSet(!AutoGet()); break;
     case ID_OPENINI: ShellExecuteW(NULL, L"open", L"notepad.exe", g_ini, NULL, SW_SHOWNORMAL); break;
     case ID_RELOAD: LoadAll(); ReloadMonSettings(); ApplyAll(); break;
@@ -1295,8 +1471,8 @@ static void ShowMenu(MonBtn *b) {
     if (BuildSub(m, &i, 0)) AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
     int pinned = 0;
-    if (g_prevFg && IsWindow(g_prevFg)) pinned = (GetWindowLongW(GetAncestor(g_prevFg, GA_ROOT), GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
-    AppendMenuW(m, MF_STRING, ID_PIN, pinned ? L"Открепить активное окно" : L"Закрепить активное окно (поверх всех, на всех столах)");
+    if (g_prevFg && IsWindow(g_prevFg) && !BadClass(g_prevFg)) pinned = IsPinned(GetAncestor(g_prevFg, GA_ROOT));
+    AppendMenuW(m, MF_STRING, ID_PIN, pinned ? L"Открепить активное окно" : L"Закрепить активное окно");
 
     HMENU s = CreatePopupMenu(), mm = CreatePopupMenu();
     AppendMenuW(s, MF_STRING, ID_APPEAR, L"Внешний вид…");
@@ -1324,10 +1500,18 @@ static void ShowMenu(MonBtn *b) {
     AppendMenuW(s, MF_STRING, ID_EDITMENU, L"Редактор меню…");
     AppendMenuW(s, MF_SEPARATOR, 0, NULL);
     AppendMenuW(s, MF_STRING, ID_EXCL, L"Исключения: где скрывать кнопку…");
+    HMENU pm = CreatePopupMenu();
+    AppendMenuW(pm, MF_STRING | (g_cfg.pinTop ? MF_CHECKED : 0), ID_PINTOP, L"Поверх всех окон");
+    AppendMenuW(pm, MF_STRING | (g_cfg.pinAll ? MF_CHECKED : 0), ID_PINALL, L"На всех рабочих столах");
+    AppendMenuW(pm, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(pm, MF_STRING | (g_cfg.keepTop ? MF_CHECKED : 0), ID_KEEPTOP, L"Не сворачивать кнопкой окна «поверх всех»");
+    AppendMenuW(s, MF_POPUP, (UINT_PTR)pm, L"Закрепление окна");
     AppendMenuW(s, MF_STRING | (g_cfg.localKeys ? MF_CHECKED : 0), ID_LOCALKEYS, L"Клавиши выполнять локально (если активен RDP/VNC)");
     AppendMenuW(s, MF_STRING, ID_REMOTE, L"Список программ RDP/VNC…");
     AppendMenuW(s, MF_SEPARATOR, 0, NULL);
     AppendMenuW(s, MF_STRING | (AutoGet() ? MF_CHECKED : 0), ID_AUTORUN, L"Запускать вместе с Windows");
+    AppendMenuW(s, MF_STRING | (g_debug ? MF_CHECKED : 0), ID_DEBUG, L"Журнал диагностики (CornerBtn.log)");
+    if (g_debug) AppendMenuW(s, MF_STRING, ID_COPYLOG, L"Скопировать журнал в буфер обмена");
     AppendMenuW(s, MF_STRING, ID_OPENINI, L"Открыть файл настроек (.ini)");
     AppendMenuW(s, MF_STRING, ID_RELOAD, L"Перечитать настройки");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)s, L"Настройки");
@@ -1457,10 +1641,13 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
     cp(g_dir, MAX_PATH, g_ini);
     wchar_t *sl = wcsrchr(g_dir, L'\\');
     if (sl) sl[1] = 0;
+    _snwprintf(g_log, MAX_PATH, L"%lsCornerBtn.log", g_dir);
+    g_log[MAX_PATH - 1] = 0;
     wchar_t *dot = wcsrchr(g_ini, L'.');
     if (dot) *dot = 0;
     wcscat(g_ini, L".ini");
 
+    CoCreateInstance(&G_ClsidVDM, NULL, CLSCTX_ALL, &G_IidVDM, (void **)&g_vdm);
     int fresh = EnsureIni();
     LoadAll();
 
@@ -1492,6 +1679,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
     if (!g_ctl) return 1;
     SyncMonitors();
     if (g_nmb == 0) return 1;
+    if (g_debug) LogStartup();
     if (fresh) SaveAll();
     SetTimer(g_ctl, 2, 1000, NULL); /* держать кнопки поверх всех */
     SetTimer(g_ctl, 3, 300, NULL);  /* проверка исключений */
