@@ -25,6 +25,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
+#define APPVER L"2.1.1"
 #define MAXE 400
 #define MAXD 7
 #define MAXMON 8
@@ -1515,6 +1516,8 @@ static void ShowMenu(MonBtn *b) {
     AppendMenuW(s, MF_STRING, ID_OPENINI, L"Открыть файл настроек (.ini)");
     AppendMenuW(s, MF_STRING, ID_RELOAD, L"Перечитать настройки");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)s, L"Настройки");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_GRAYED | MF_STRING, 0, L"CornerBtn версия " APPVER);
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Выход");
 
     POINT pt;
