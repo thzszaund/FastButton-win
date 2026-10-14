@@ -1,0 +1,52 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # нужно, чтобы создавать релиз по тегу
+
+jobs:
+  windows-exe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+
+      - name: Build CornerBtn.exe
+        working-directory: src
+        run: |
+          x86_64-w64-mingw32-windres app.rc -O coff -o app.res.o
+          x86_64-w64-mingw32-gcc -municode -mwindows -O2 -Wall -Wextra \
+            -o ../CornerBtn.exe CornerBtn.c app.res.o -static \
+            -lcomctl32 -lcomdlg32 -lshell32 -lole32 -loleaut32 \
+            -ladvapi32 -luser32 -lgdi32 -ldwmapi -luuid -s
+
+      - name: Check result
+        run: |
+          file CornerBtn.exe
+          ls -l CornerBtn.exe
+          sha256sum CornerBtn.exe | tee CornerBtn.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CornerBtn-windows-x64
+          path: |
+            CornerBtn.exe
+            CornerBtn.exe.sha256
+
+      - name: Publish release (only for tags v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" CornerBtn.exe CornerBtn.exe.sha256 \
+            --title "CornerBtn $GITHUB_REF_NAME" --generate-notes
