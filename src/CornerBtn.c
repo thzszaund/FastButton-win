@@ -25,7 +25,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.1.1"
+#define APPVER L"2.2.0"
 #define MAXE 400
 #define MAXD 7
 #define MAXMON 8
@@ -62,7 +62,7 @@ static int g_nmb;
 static Entry g_e[MAXE];
 static int g_n;
 static Act g_click, g_dbl, g_mid;
-static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop; COLORREF color; wchar_t icon[MAX_PATH]; } g_cfg;
+static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned; COLORREF color; wchar_t icon[MAX_PATH]; } g_cfg;
 static wchar_t g_excl[MAXLIST][64], g_remote[MAXLIST][64];
 static int g_nexcl, g_nremote;
 static HICON g_icon;
@@ -239,6 +239,7 @@ static void LoadAll(void) {
     g_cfg.pinTop = GetI(L"Options", L"PinTopmost", 1) ? 1 : 0;
     g_cfg.pinAll = GetI(L"Options", L"PinAllDesktops", 1) ? 1 : 0;
     g_cfg.keepTop = GetI(L"Options", L"KeepTopmost", 0) ? 1 : 0;
+    g_cfg.raisePinned = GetI(L"Options", L"RaisePinned", 1) ? 1 : 0;
     g_debug = GetI(L"Options", L"Debug", 0) ? 1 : 0;
     GetS(L"Button", L"Color", L"3399FF", b, 64);
     g_cfg.color = ParseColor(b, RGB(0x33, 0x99, 0xFF));
@@ -301,6 +302,7 @@ static void SaveCfg(void) {
     PutI(L"Options", L"PinTopmost", g_cfg.pinTop);
     PutI(L"Options", L"PinAllDesktops", g_cfg.pinAll);
     PutI(L"Options", L"KeepTopmost", g_cfg.keepTop);
+    PutI(L"Options", L"RaisePinned", g_cfg.raisePinned);
     PutI(L"Options", L"Debug", g_debug);
 }
 static void SaveMenu(void) {
@@ -416,22 +418,59 @@ static void DescWin(HWND w, wchar_t *out, int n) {
 }
 
 /* IVirtualDesktopManager (документированный): принадлежит ли окно текущему виртуальному рабочему столу */
-static const GUID G_ClsidVDM = { 0xAA509086, 0x5CA9, 0x4C25, { 0x8F, 0x95, 0x58, 0x9D, 0x3C, 0x07, 0xB4, 0x8B } };
+static const GUID G_ClsidVDM = { 0xAA509086, 0x5CA9, 0x4C25, { 0x8F, 0x95, 0x58, 0x9D, 0x3C, 0x07, 0xB4, 0x8A } };
 static const GUID G_IidVDM   = { 0xA5CD92FF, 0x29BE, 0x454C, { 0x8D, 0x04, 0xD8, 0x28, 0x79, 0xFB, 0x3F, 0x1B } };
 typedef struct {
     HRESULT (STDMETHODCALLTYPE *QI)(void *, REFIID, void **);
     ULONG (STDMETHODCALLTYPE *AddRef)(void *);
     ULONG (STDMETHODCALLTYPE *Release)(void *);
     HRESULT (STDMETHODCALLTYPE *IsWindowOnCurrentVirtualDesktop)(void *, HWND, BOOL *);
-    void *GetWindowDesktopId, *MoveWindowToDesktop;
+    HRESULT (STDMETHODCALLTYPE *GetWindowDesktopId)(void *, HWND, GUID *);
+    void *MoveWindowToDesktop;
 } VDMVtbl;
 typedef struct { VDMVtbl *v; } VDM;
 static VDM *g_vdm;
+static HRESULT g_vdmHr;
+static HWND g_pinned[32];
+static int g_npinned, g_haveDesk;
+static GUID g_lastDesk;
 static int OnCurDesk(HWND w) {
     BOOL on = TRUE;
     if (!g_vdm) return 1;
     if (FAILED(g_vdm->v->IsWindowOnCurrentVirtualDesktop(g_vdm, w, &on))) return 1;
     return on ? 1 : 0;
+}
+
+/* закреплённые нами окна: поднимаем наверх после смены виртуального стола */
+static void PinnedAdd(HWND w) {
+    for (int i = 0; i < g_npinned; i++) if (g_pinned[i] == w) return;
+    if (g_npinned < 32) g_pinned[g_npinned++] = w;
+}
+static void PinnedRemove(HWND w) {
+    for (int i = 0; i < g_npinned; i++)
+        if (g_pinned[i] == w) { g_pinned[i] = g_pinned[--g_npinned]; return; }
+}
+static void RaisePinned(void) {
+    for (int i = g_npinned - 1; i >= 0; i--) {
+        HWND w = g_pinned[i];
+        if (!IsWindow(w)) { g_pinned[i] = g_pinned[--g_npinned]; continue; }
+        if (IsIconic(w)) continue;
+        SetWindowPos(w, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        Log(L"поднято закреплённое окно hwnd=%p", (void *)w);
+    }
+}
+static void CheckDesktopSwitch(void) {
+    if (!g_vdm || !g_npinned || !g_cfg.raisePinned || g_inMenu || g_modal) return;
+    HWND fg = GetForegroundWindow();
+    if (!fg || IsOurs(fg) || BadClass(fg)) return;
+    for (int i = 0; i < g_npinned; i++) if (g_pinned[i] == fg) return;
+    GUID id;
+    if (FAILED(g_vdm->v->GetWindowDesktopId(g_vdm, fg, &id))) return;
+    if (!g_haveDesk) { g_lastDesk = id; g_haveDesk = 1; return; }
+    if (!memcmp(&id, &g_lastDesk, sizeof id)) return;
+    g_lastDesk = id;
+    Log(L"смена виртуального стола, поднимаю закреплённые окна");
+    RaisePinned();
 }
 
 static HWND FgTarget(void) { /* активное окно "до нас" */
@@ -591,6 +630,14 @@ static int PinWin(HWND w, int op, wchar_t *err, int en) {
     if (FAILED(hr) || !pa) { SetErr(err, en, L"шаг 3 (закрепление)", hr); goto done; }
     hr = coll->v->GetViewForHwnd(coll, w, &view);
     Log(L"pin: GetViewForHwnd hr=0x%08lX view=%p", (unsigned long)hr, view);
+    if (FAILED(hr) || !view) {
+        HWND ro = GetAncestor(w, GA_ROOTOWNER);
+        if (ro && ro != w) {
+            view = NULL;
+            hr = coll->v->GetViewForHwnd(coll, ro, &view);
+            Log(L"pin: повтор для окна-владельца hwnd=%p hr=0x%08lX view=%p", (void *)ro, (unsigned long)hr, view);
+        }
+    }
     if (FAILED(hr) || !view) { SetErr(err, en, L"шаг 4 (окно в списке)", FAILED(hr) ? hr : E_POINTER); goto done; }
     hr = ((IUnknown *)view)->lpVtbl->QueryInterface((IUnknown *)view, &G_IidView, &view2);
     Log(L"pin: QueryInterface(IApplicationView) hr=0x%08lX", (unsigned long)hr);
@@ -628,11 +675,13 @@ static void PinToggle(HWND w) {
         MessageBoxW(NULL, L"В настройках отключены оба режима закрепления.\nВключите хотя бы один: Настройки → Закрепление окна.", APPNAME, MB_ICONINFORMATION);
         return;
     }
+    if (g_debug) { wchar_t dd[700]; DescWin(w, dd, 700); Log(L"pin target: %ls", dd); }
     if (!IsPinned(w)) {
         int ok = 1;
         wchar_t err[300] = L"", build[120], msg[900];
         if (g_cfg.pinAll) ok = (PinWin(w, 1, err, 300) == 1);
         if (ok) {
+            if (g_cfg.pinAll) PinnedAdd(w);
             if (g_cfg.pinTop) SetWindowPos(w, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         } else {
             WinBuild(build, 120);
@@ -645,6 +694,7 @@ static void PinToggle(HWND w) {
     } else {
         if (GetWindowLongW(w, GWL_EXSTYLE) & WS_EX_TOPMOST) SetWindowPos(w, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         PinWin(w, 0, NULL, 0);
+        PinnedRemove(w);
     }
 }
 
@@ -1362,7 +1412,7 @@ static void ShowEditor(void) {
 
 /* ---------- меню ---------- */
 enum { ID_APPEAR = 100, ID_CLICK, ID_DBL, ID_MID, ID_EDITMENU, ID_AUTORUN, ID_OPENINI, ID_RELOAD, ID_EXIT,
-       ID_PIN, ID_EXCL, ID_REMOTE, ID_LOCALKEYS, ID_PINTOP, ID_PINALL, ID_KEEPTOP, ID_DEBUG, ID_COPYLOG, ID_CUSTOM = 1000, ID_MON = 2000 };
+       ID_PIN, ID_EXCL, ID_REMOTE, ID_LOCALKEYS, ID_PINTOP, ID_PINALL, ID_KEEPTOP, ID_DEBUG, ID_COPYLOG, ID_RAISE, ID_CUSTOM = 1000, ID_MON = 2000 };
 
 static int BuildSub(HMENU m, int *i, int depth) {
     int count = 0;
@@ -1384,7 +1434,7 @@ static int BuildSub(HMENU m, int *i, int depth) {
 static void LogStartup(void) {
     wchar_t bld[120];
     WinBuild(bld, 120);
-    Log(L"=== CornerBtn: журнал включён. %ls. VirtualDesktopManager: %ls", bld, g_vdm ? L"да" : L"НЕТ");
+    Log(L"=== CornerBtn: журнал включён. %ls. VirtualDesktopManager: %ls (hr=0x%08lX)", bld, g_vdm ? L"да" : L"НЕТ", (unsigned long)g_vdmHr);
     for (int i = 0; i < g_nmb; i++)
         Log(L"  монитор %d: %ls %ld,%ld..%ld,%ld основной=%d включён=%d угол=%d dx=%d dy=%d", i + 1, g_mb[i]->dev,
             g_mb[i]->rc.left, g_mb[i]->rc.top, g_mb[i]->rc.right, g_mb[i]->rc.bottom, g_mb[i]->primary, g_mb[i]->enabled, g_mb[i]->corner, g_mb[i]->dx, g_mb[i]->dy);
@@ -1455,8 +1505,9 @@ static void HandleCmd(int cmd, MonBtn *b) {
     case ID_LOCALKEYS: g_cfg.localKeys = !g_cfg.localKeys; PutI(L"Options", L"LocalKeys", g_cfg.localKeys); break;
     case ID_PINTOP: g_cfg.pinTop = !g_cfg.pinTop; PutI(L"Options", L"PinTopmost", g_cfg.pinTop); break;
     case ID_PINALL: g_cfg.pinAll = !g_cfg.pinAll; PutI(L"Options", L"PinAllDesktops", g_cfg.pinAll); break;
+    case ID_RAISE: g_cfg.raisePinned = !g_cfg.raisePinned; PutI(L"Options", L"RaisePinned", g_cfg.raisePinned); break;
     case ID_KEEPTOP: g_cfg.keepTop = !g_cfg.keepTop; PutI(L"Options", L"KeepTopmost", g_cfg.keepTop); break;
-    case ID_DEBUG: g_debug = !g_debug; PutI(L"Options", L"Debug", g_debug); if (g_debug) LogStartup(); break;
+    case ID_DEBUG: g_debug = !g_debug; PutI(L"Options", L"Debug", g_debug); if (g_debug) { DeleteFileW(g_log); LogStartup(); } break;
     case ID_COPYLOG: CopyLog(); break;
     case ID_AUTORUN: AutoSet(!AutoGet()); break;
     case ID_OPENINI: ShellExecuteW(NULL, L"open", L"notepad.exe", g_ini, NULL, SW_SHOWNORMAL); break;
@@ -1505,6 +1556,7 @@ static void ShowMenu(MonBtn *b) {
     AppendMenuW(pm, MF_STRING | (g_cfg.pinTop ? MF_CHECKED : 0), ID_PINTOP, L"Поверх всех окон");
     AppendMenuW(pm, MF_STRING | (g_cfg.pinAll ? MF_CHECKED : 0), ID_PINALL, L"На всех рабочих столах");
     AppendMenuW(pm, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(pm, MF_STRING | (g_cfg.raisePinned ? MF_CHECKED : 0), ID_RAISE, L"Поднимать закреплённые окна после смены стола");
     AppendMenuW(pm, MF_STRING | (g_cfg.keepTop ? MF_CHECKED : 0), ID_KEEPTOP, L"Не сворачивать кнопкой окна «поверх всех»");
     AppendMenuW(s, MF_POPUP, (UINT_PTR)pm, L"Закрепление окна");
     AppendMenuW(s, MF_STRING | (g_cfg.localKeys ? MF_CHECKED : 0), ID_LOCALKEYS, L"Клавиши выполнять локально (если активен RDP/VNC)");
@@ -1614,7 +1666,7 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_TIMER:
         if (w == 9) { KillTimer(h, 9); SyncMonitors(); }
         else if (w == 2) Reassert();
-        else if (w == 3) UpdateExclusion();
+        else if (w == 3) { UpdateExclusion(); CheckDesktopSwitch(); }
         return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
@@ -1650,7 +1702,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
     if (dot) *dot = 0;
     wcscat(g_ini, L".ini");
 
-    CoCreateInstance(&G_ClsidVDM, NULL, CLSCTX_ALL, &G_IidVDM, (void **)&g_vdm);
+    g_vdmHr = CoCreateInstance(&G_ClsidVDM, NULL, CLSCTX_ALL, &G_IidVDM, (void **)&g_vdm);
     int fresh = EnsureIni();
     LoadAll();
 
@@ -1682,7 +1734,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
     if (!g_ctl) return 1;
     SyncMonitors();
     if (g_nmb == 0) return 1;
-    if (g_debug) LogStartup();
+    if (g_debug) { DeleteFileW(g_log); LogStartup(); }
     if (fresh) SaveAll();
     SetTimer(g_ctl, 2, 1000, NULL); /* держать кнопки поверх всех */
     SetTimer(g_ctl, 3, 300, NULL);  /* проверка исключений */
