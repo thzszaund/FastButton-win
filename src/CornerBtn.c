@@ -25,7 +25,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.2.0"
+#define APPVER L"2.2.1"
 #define MAXE 400
 #define MAXD 7
 #define MAXMON 8
@@ -459,18 +459,55 @@ static void RaisePinned(void) {
         Log(L"поднято закреплённое окно hwnd=%p", (void *)w);
     }
 }
+static int g_raiseTicks, g_haveReg;
+static GUID g_regDesk;
+/* номер текущего виртуального стола из реестра (обновляется проводником при переключении) */
+static int ReadCurDesk(GUID *g) {
+    DWORD sid = 0;
+    wchar_t path[260];
+    ProcessIdToSessionId(GetCurrentProcessId(), &sid);
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 0) _snwprintf(path, 260, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo\\%lu\\VirtualDesktops", (unsigned long)sid);
+        else cp(path, 260, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops");
+        path[259] = 0;
+        HKEY k;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+            BYTE b[16];
+            DWORD sz = 16;
+            LONG r = RegQueryValueExW(k, L"CurrentVirtualDesktop", NULL, NULL, b, &sz);
+            RegCloseKey(k);
+            if (r == ERROR_SUCCESS && sz == 16) { memcpy(g, b, 16); return pass + 1; }
+        }
+    }
+    return 0;
+}
 static void CheckDesktopSwitch(void) {
-    if (!g_vdm || !g_npinned || !g_cfg.raisePinned || g_inMenu || g_modal) return;
-    HWND fg = GetForegroundWindow();
-    if (!fg || IsOurs(fg) || BadClass(fg)) return;
-    for (int i = 0; i < g_npinned; i++) if (g_pinned[i] == fg) return;
-    GUID id;
-    if (FAILED(g_vdm->v->GetWindowDesktopId(g_vdm, fg, &id))) return;
-    if (!g_haveDesk) { g_lastDesk = id; g_haveDesk = 1; return; }
-    if (!memcmp(&id, &g_lastDesk, sizeof id)) return;
-    g_lastDesk = id;
-    Log(L"смена виртуального стола, поднимаю закреплённые окна");
-    RaisePinned();
+    if (g_inMenu || g_modal) return;
+    GUID cur;
+    int src = ReadCurDesk(&cur);
+    if (src) {
+        if (!g_haveReg) { g_regDesk = cur; g_haveReg = 1; Log(L"текущий виртуальный стол определён по реестру (источник %d)", src); }
+        else if (memcmp(&cur, &g_regDesk, sizeof cur)) {
+            g_regDesk = cur;
+            Log(L"смена виртуального стола (реестр)");
+            g_raiseTicks = 5;
+        }
+    } else if (g_vdm && g_npinned) { /* запасной способ: по активному окну */
+        HWND fg = GetForegroundWindow();
+        if (fg && !IsOurs(fg) && !BadClass(fg)) {
+            int mine = 0;
+            for (int i = 0; i < g_npinned; i++) if (g_pinned[i] == fg) mine = 1;
+            GUID id;
+            if (!mine && SUCCEEDED(g_vdm->v->GetWindowDesktopId(g_vdm, fg, &id))) {
+                if (!g_haveDesk) { g_lastDesk = id; g_haveDesk = 1; }
+                else if (memcmp(&id, &g_lastDesk, sizeof id)) { g_lastDesk = id; Log(L"смена виртуального стола (по активному окну)"); g_raiseTicks = 5; }
+            }
+        }
+    }
+    if (g_raiseTicks > 0) {
+        g_raiseTicks--;
+        if (g_npinned && g_cfg.raisePinned) RaisePinned();
+    }
 }
 
 static HWND FgTarget(void) { /* активное окно "до нас" */
