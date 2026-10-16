@@ -25,7 +25,8 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.2.1"
+#define APPVER L"2.3.0"
+#define IDI_APP 100
 #define MAXE 400
 #define MAXD 7
 #define MAXMON 8
@@ -766,6 +767,10 @@ static void RunAct(const Act *a, MonBtn *b) { RunSpec(a->action, a->args, b); }
 static void LoadIconCfg(void) {
     if (g_icon) { DestroyIcon(g_icon); g_icon = NULL; }
     if (!g_cfg.icon[0] || g_cfg.size < 10) return;
+    if (!wcscmp(g_cfg.icon, L"@app")) { /* значок самой программы */
+        g_icon = (HICON)LoadImageW(g_hinst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, g_cfg.size, g_cfg.size, 0);
+        return;
+    }
     wchar_t raw[MAX_PATH], p[MAX_PATH * 2];
     ExpandEnvironmentStringsW(g_cfg.icon, raw, MAX_PATH);
     if (raw[1] != L':' && raw[0] != L'\\') _snwprintf(p, MAX_PATH * 2, L"%ls%ls", g_dir, raw);
@@ -986,6 +991,7 @@ static void AppCmd(Dlg *d, int id, int code) {
         }
         break;
     }
+    case 209: SetWindowTextW(a->eIcon, L"@app"); break;
     case 207: {
         wchar_t f[MAX_PATH] = L"";
         OPENFILENAMEW o;
@@ -1018,7 +1024,7 @@ static void AppCmd(Dlg *d, int id, int code) {
 static void ShowAppearance(void) {
     AppDlg a;
     memset(&a, 0, sizeof a);
-    NewDlg(&a.d, L"Внешний вид кнопок", 440, 276);
+    NewDlg(&a.d, L"Внешний вид кнопок", 440, 290);
     a.d.oncmd = AppCmd;
     HWND h = a.d.h;
     wchar_t b[MAX_PATH];
@@ -1047,10 +1053,11 @@ static void ShowAppearance(void) {
     SendMessageW(a.cbShape, CB_ADDSTRING, 0, (LPARAM)L"Круг");
     SendMessageW(a.cbShape, CB_SETCURSEL, g_cfg.shape, 0);
     y += 36;
-    Lbl(h, L"Иконка (.ico, .exe, .dll; пусто = без иконки; рисуется при размере от 10):", 12, y, 416, 18);
-    y += 20;
-    a.eIcon = Edt(h, 12, y, 326, 24, 206);
+    Lbl(h, L"Иконка: файл .ico/.exe/.dll или @app (значок программы). Пусто — без иконки. Рисуется при размере кнопки от 10.", 12, y, 416, 32);
+    y += 34;
+    a.eIcon = Edt(h, 12, y, 206, 24, 206);
     SetWindowTextW(a.eIcon, g_cfg.icon);
+    Btn(h, L"Значок программы", 226, y, 112, 24, 209, 0);
     Btn(h, L"Обзор…", 346, y, 82, 24, 207, 0);
     y += 44;
     Btn(h, L"OK", 248, y, 85, 28, IDOK, 1);
@@ -1758,6 +1765,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
     wc.hInstance = hi;
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(IDI_APP));
+    wc.hIconSm = wc.hIcon;
     wc.lpszClassName = L"CBDlg";
     RegisterClassExW(&wc);
     memset(&wc, 0, sizeof wc);
