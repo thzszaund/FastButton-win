@@ -25,7 +25,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.3.0"
+#define APPVER L"2.3.1"
 #define IDI_APP 100
 #define MAXE 400
 #define MAXD 7
@@ -451,13 +451,50 @@ static void PinnedRemove(HWND w) {
     for (int i = 0; i < g_npinned; i++)
         if (g_pinned[i] == w) { g_pinned[i] = g_pinned[--g_npinned]; return; }
 }
+/* сколько видимых обычных окон лежит выше w и пересекается с ним (по z-порядку) */
+static int CountAbove(HWND w) {
+    RECT r;
+    if (!GetWindowRect(w, &r)) return -1;
+    int n = 0;
+    for (HWND h = GetWindow(w, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV)) {
+        if (!IsWindowVisible(h) || IsIconic(h)) continue;
+        LONG ex = GetWindowLongW(h, GWL_EXSTYLE);
+        if (ex & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) continue;
+        if (IsOurs(h) || BadClass(h)) continue;
+        DWORD cl = 0;
+        DwmGetWindowAttribute(h, 13 /* DWMWA_CLOAKED */, &cl, sizeof cl);
+        if (cl) continue;
+        RECT hr, x;
+        if (!GetWindowRect(h, &hr)) continue;
+        if (IntersectRect(&x, &r, &hr)) n++;
+    }
+    return n;
+}
+/* поднять окно без активации; результат проверяется по z-порядку */
+static void RaiseWin(HWND w) {
+    const UINT f = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+    if (GetWindowLongW(w, GWL_EXSTYLE) & WS_EX_TOPMOST) return; /* уже "поверх всех" */
+    int before = CountAbove(w);
+    if (before <= 0) return;
+    BOOL ok1 = SetWindowPos(w, HWND_TOP, 0, 0, 0, 0, f);
+    DWORD e1 = ok1 ? 0 : GetLastError();
+    int a1 = CountAbove(w);
+    if (a1 > 0) { /* HWND_TOP не помог: кратко делаем "поверх всех" и сразу возвращаем */
+        BOOL ok2 = SetWindowPos(w, HWND_TOPMOST, 0, 0, 0, 0, f);
+        DWORD e2 = ok2 ? 0 : GetLastError();
+        BOOL ok3 = SetWindowPos(w, HWND_NOTOPMOST, 0, 0, 0, 0, f);
+        DWORD e3 = ok3 ? 0 : GetLastError();
+        int a2 = CountAbove(w);
+        Log(L"  raise hwnd=%p: выше было %d; HWND_TOP ok=%d err=%lu -> выше %d; TOPMOST ok=%d err=%lu, NOTOPMOST ok=%d err=%lu -> выше %d",
+            (void *)w, before, (int)ok1, (unsigned long)e1, a1, (int)ok2, (unsigned long)e2, (int)ok3, (unsigned long)e3, a2);
+    } else Log(L"  raise hwnd=%p: выше было %d; HWND_TOP ok=%d -> выше %d", (void *)w, before, (int)ok1, a1);
+}
 static void RaisePinned(void) {
     for (int i = g_npinned - 1; i >= 0; i--) {
         HWND w = g_pinned[i];
         if (!IsWindow(w)) { g_pinned[i] = g_pinned[--g_npinned]; continue; }
         if (IsIconic(w)) continue;
-        SetWindowPos(w, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        Log(L"поднято закреплённое окно hwnd=%p", (void *)w);
+        RaiseWin(w);
     }
 }
 static int g_raiseTicks, g_haveReg;
@@ -491,6 +528,7 @@ static void CheckDesktopSwitch(void) {
         else if (memcmp(&cur, &g_regDesk, sizeof cur)) {
             g_regDesk = cur;
             Log(L"смена виртуального стола (реестр)");
+            if (g_debug) { HWND fg = GetForegroundWindow(); wchar_t dd[700]; if (fg) { DescWin(fg, dd, 700); Log(L"  активное окно сейчас: %ls", dd); } }
             g_raiseTicks = 5;
         }
     } else if (g_vdm && g_npinned) { /* запасной способ: по активному окну */
