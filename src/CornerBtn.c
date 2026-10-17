@@ -25,7 +25,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.3.1"
+#define APPVER L"2.4.0"
 #define IDI_APP 100
 #define MAXE 400
 #define MAXD 7
@@ -63,7 +63,7 @@ static int g_nmb;
 static Entry g_e[MAXE];
 static int g_n;
 static Act g_click, g_dbl, g_mid;
-static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned; COLORREF color; wchar_t icon[MAX_PATH]; } g_cfg;
+static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; } g_cfg;
 static wchar_t g_excl[MAXLIST][64], g_remote[MAXLIST][64];
 static int g_nexcl, g_nremote;
 static HICON g_icon;
@@ -241,6 +241,7 @@ static void LoadAll(void) {
     g_cfg.pinAll = GetI(L"Options", L"PinAllDesktops", 1) ? 1 : 0;
     g_cfg.keepTop = GetI(L"Options", L"KeepTopmost", 0) ? 1 : 0;
     g_cfg.raisePinned = GetI(L"Options", L"RaisePinned", 1) ? 1 : 0;
+    g_cfg.show = GetI(L"Options", L"ShowButtons", 1) ? 1 : 0;
     g_debug = GetI(L"Options", L"Debug", 0) ? 1 : 0;
     GetS(L"Button", L"Color", L"3399FF", b, 64);
     g_cfg.color = ParseColor(b, RGB(0x33, 0x99, 0xFF));
@@ -305,6 +306,7 @@ static void SaveCfg(void) {
     PutI(L"Options", L"KeepTopmost", g_cfg.keepTop);
     PutI(L"Options", L"RaisePinned", g_cfg.raisePinned);
     PutI(L"Options", L"Debug", g_debug);
+    PutI(L"Options", L"ShowButtons", g_cfg.show);
 }
 static void SaveMenu(void) {
     WritePrivateProfileStringW(L"Menu", NULL, NULL, g_ini); /* удалить секцию */
@@ -827,7 +829,7 @@ static void ApplyAlpha(MonBtn *b) {
     SetLayeredWindowAttributes(b->hwnd, 0, (BYTE)(255 * pct / 100), LWA_ALPHA);
 }
 static void UpdateVis(MonBtn *b) {
-    int want = b->enabled && !b->hidden;
+    int want = g_cfg.show && b->enabled && !b->hidden;
     if (want) { if (!IsWindowVisible(b->hwnd)) ShowWindow(b->hwnd, SW_SHOWNOACTIVATE); }
     else if (IsWindowVisible(b->hwnd)) ShowWindow(b->hwnd, SW_HIDE);
 }
@@ -1494,7 +1496,7 @@ static void ShowEditor(void) {
 
 /* ---------- меню ---------- */
 enum { ID_APPEAR = 100, ID_CLICK, ID_DBL, ID_MID, ID_EDITMENU, ID_AUTORUN, ID_OPENINI, ID_RELOAD, ID_EXIT,
-       ID_PIN, ID_EXCL, ID_REMOTE, ID_LOCALKEYS, ID_PINTOP, ID_PINALL, ID_KEEPTOP, ID_DEBUG, ID_COPYLOG, ID_RAISE, ID_CUSTOM = 1000, ID_MON = 2000 };
+       ID_PIN, ID_EXCL, ID_REMOTE, ID_LOCALKEYS, ID_PINTOP, ID_PINALL, ID_KEEPTOP, ID_DEBUG, ID_COPYLOG, ID_RAISE, ID_TOGGLE, ID_CP1, ID_CP2, ID_CP3, ID_CP4, ID_CP5, ID_CUSTOM = 1000, ID_MON = 2000 };
 
 static int BuildSub(HMENU m, int *i, int depth) {
     int count = 0;
@@ -1513,6 +1515,203 @@ static int BuildSub(HMENU m, int *i, int depth) {
     }
     return count;
 }
+/* ---------- трей и копирование данных активного окна ---------- */
+#define WM_TRAY (WM_APP + 1)
+static NOTIFYICONDATAW g_nid;
+static int g_trayOn;
+static UINT g_wmTaskbar;
+static HICON g_trayIcon;
+
+static void TrayTip(wchar_t *tip, int n) {
+    _snwprintf(tip, (size_t)n, L"CornerBtn %ls — кнопка в углу: %ls", APPVER, g_cfg.show ? L"показана" : L"скрыта");
+    tip[n - 1] = 0;
+}
+static int TrayAdd(void) {
+    if (!g_trayIcon) g_trayIcon = (HICON)LoadImageW(g_hinst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    memset(&g_nid, 0, sizeof g_nid);
+    g_nid.cbSize = sizeof g_nid;
+    g_nid.hWnd = g_ctl;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAY;
+    g_nid.hIcon = g_trayIcon;
+    TrayTip(g_nid.szTip, 128);
+    g_trayOn = Shell_NotifyIconW(NIM_ADD, &g_nid) ? 1 : 0;
+    return g_trayOn;
+}
+static void TrayRemove(void) {
+    if (g_trayOn) { Shell_NotifyIconW(NIM_DELETE, &g_nid); g_trayOn = 0; }
+}
+static void TrayUpdate(void) {
+    if (!g_trayOn) return;
+    TrayTip(g_nid.szTip, 128);
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+static void Balloon(const wchar_t *title, const wchar_t *msg) {
+    if (!g_trayOn) return;
+    NOTIFYICONDATAW n = g_nid;
+    n.uFlags = NIF_INFO;
+    n.dwInfoFlags = NIIF_NONE | NIIF_NOSOUND;
+    cp(n.szInfoTitle, WSZ(n.szInfoTitle), title);
+    cp(n.szInfo, WSZ(n.szInfo), msg);
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+static void ToggleShow(void) {
+    g_cfg.show = !g_cfg.show;
+    PutI(L"Options", L"ShowButtons", g_cfg.show);
+    for (int i = 0; i < g_nmb; i++) UpdateVis(g_mb[i]);
+    TrayUpdate();
+}
+static const wchar_t *ShowLabel(void) {
+    return g_cfg.show ? L"Кнопка в углу экрана: ПОКАЗАНА  (нажмите, чтобы скрыть)" : L"Кнопка в углу экрана: СКРЫТА  (нажмите, чтобы показать)";
+}
+
+typedef struct { DWORD pid; HWND found; } KidFind;
+static BOOL CALLBACK EnumKid(HWND c, LPARAM l) {
+    KidFind *k = (KidFind *)l;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(c, &pid);
+    if (pid && pid != k->pid) { k->found = c; return FALSE; }
+    return TRUE;
+}
+/* для приложений из магазина окно принадлежит ApplicationFrameHost; ищем окно настоящей программы внутри */
+static HWND RealWin(HWND w) {
+    wchar_t cls[64];
+    GetClassNameW(w, cls, 64);
+    if (!wcscmp(cls, L"ApplicationFrameWindow")) {
+        KidFind k = { 0, NULL };
+        GetWindowThreadProcessId(w, &k.pid);
+        EnumChildWindows(w, EnumKid, (LPARAM)&k);
+        if (k.found) return k.found;
+    }
+    return w;
+}
+static int ExePath(HWND w, wchar_t *out, int n) {
+    DWORD pid = 0;
+    out[0] = 0;
+    GetWindowThreadProcessId(w, &pid);
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return 0;
+    DWORD sz = (DWORD)n;
+    int ok = QueryFullProcessImageNameW(h, 0, out, &sz) ? 1 : 0;
+    CloseHandle(h);
+    return ok;
+}
+typedef struct { USHORT Length, MaximumLength; PWSTR Buffer; } USTR;
+typedef LONG (NTAPI *NtQIPfn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+static int ProcCmdLine(HWND w, wchar_t *out, int n) { /* командная строка процесса (Windows 8.1+) */
+    DWORD pid = 0;
+    int ok = 0;
+    out[0] = 0;
+    GetWindowThreadProcessId(w, &pid);
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return 0;
+    static NtQIPfn f;
+    if (!f) f = (NtQIPfn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+    if (f) {
+        ULONG cap = 8192, len = 0;
+        BYTE *buf = (BYTE *)malloc(cap);
+        LONG st = -1;
+        for (int k = 0; buf && k < 2; k++) {
+            st = f(h, 60 /* ProcessCommandLineInformation */, buf, cap, &len);
+            if (st == (LONG)0xC0000004 || st == (LONG)0xC0000023) {
+                cap = len + 16;
+                BYTE *nb = (BYTE *)realloc(buf, cap);
+                if (!nb) { free(buf); buf = NULL; break; }
+                buf = nb;
+                continue;
+            }
+            break;
+        }
+        if (buf && st >= 0) {
+            USTR *u = (USTR *)buf;
+            if (u->Buffer && u->Length) {
+                int cnt = u->Length / 2;
+                if (cnt > n - 1) cnt = n - 1;
+                memcpy(out, u->Buffer, (size_t)cnt * sizeof(wchar_t));
+                out[cnt] = 0;
+                ok = 1;
+            }
+        }
+        free(buf);
+    }
+    CloseHandle(h);
+    return ok;
+}
+static int CopyText(const wchar_t *s) {
+    size_t bytes = (wcslen(s) + 1) * sizeof(wchar_t);
+    HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!g) return 0;
+    memcpy(GlobalLock(g), s, bytes);
+    GlobalUnlock(g);
+    if (!OpenClipboard(g_ctl)) { GlobalFree(g); return 0; }
+    EmptyClipboard();
+    SetClipboardData(CF_UNICODETEXT, g);
+    CloseClipboard();
+    return 1;
+}
+static void CopyInfo(int which) {
+    HWND t = g_prevFg;
+    if (!t || !IsWindow(t) || IsOurs(t) || BadClass(t)) {
+        MessageBoxW(NULL, L"Нет подходящего активного окна.", APPNAME, MB_ICONINFORMATION);
+        return;
+    }
+    HWND root = GetAncestor(t, GA_ROOT);
+    if (!root) root = t;
+    HWND rw = RealWin(root);
+    static wchar_t buf[3000];
+    wchar_t path[MAX_PATH * 2];
+    int noargs = 0;
+    buf[0] = 0;
+    path[0] = 0;
+    if (which == 1) {
+        GetWindowTextW(root, buf, 3000);
+        if (!buf[0]) { MessageBoxW(NULL, L"У этого окна нет заголовка.", APPNAME, MB_ICONINFORMATION); return; }
+    } else {
+        if (!ExePath(rw, path, MAX_PATH * 2)) {
+            MessageBoxW(NULL, L"Не удалось определить программу этого окна (возможно, у неё повышенные права).", APPNAME, MB_ICONINFORMATION);
+            return;
+        }
+        if (which == 2) {
+            wchar_t *s = wcsrchr(path, L'\\');
+            cp(buf, 3000, s ? s + 1 : path);
+        } else if (which == 4) {
+            _snwprintf(buf, 3000, L"\"%ls\"", path);
+        } else if (which == 3) {
+            static wchar_t cmd[2600], args[2600];
+            const wchar_t *p;
+            args[0] = 0;
+            if (ProcCmdLine(rw, cmd, 2600)) {
+                p = cmd;
+                while (*p && iswspace(*p)) p++;
+                if (*p == L'"') { p++; while (*p && *p != L'"') p++; if (*p) p++; }
+                else while (*p && !iswspace(*p)) p++;
+                while (*p && iswspace(*p)) p++;
+                cp(args, 2600, p);
+                Trim(args);
+            } else noargs = 1;
+            if (args[0]) _snwprintf(buf, 3000, L"\"%ls\" %ls", path, args);
+            else _snwprintf(buf, 3000, L"\"%ls\"", path);
+        } else if (which == 5) {
+            PIDLIST_ABSOLUTE pidl = NULL;
+            if (SUCCEEDED(SHParseDisplayName(path, NULL, &pidl, 0, NULL)) && pidl) {
+                SHOpenFolderAndSelectItems(pidl, 0, NULL, 0);
+                CoTaskMemFree(pidl);
+            } else {
+                wchar_t a[MAX_PATH * 2 + 16];
+                _snwprintf(a, MAX_PATH * 2 + 16, L"/select,\"%ls\"", path);
+                a[MAX_PATH * 2 + 15] = 0;
+                ShellExecuteW(NULL, L"open", L"explorer.exe", a, NULL, SW_SHOWNORMAL);
+            }
+            return;
+        }
+    }
+    buf[2999] = 0;
+    if (CopyText(buf)) Balloon(noargs ? L"Скопировано без аргументов (не удалось их прочитать)" : L"Скопировано", buf);
+    else MessageBoxW(NULL, L"Не удалось скопировать в буфер обмена.", APPNAME, MB_ICONWARNING);
+}
+
 static void LogStartup(void) {
     wchar_t bld[120];
     WinBuild(bld, 120);
@@ -1585,6 +1784,8 @@ static void HandleCmd(int cmd, MonBtn *b) {
                      g_remote, &g_nremote)) SaveList(L"Remote", g_remote, g_nremote);
         break;
     case ID_LOCALKEYS: g_cfg.localKeys = !g_cfg.localKeys; PutI(L"Options", L"LocalKeys", g_cfg.localKeys); break;
+    case ID_TOGGLE: ToggleShow(); break;
+    case ID_CP1: case ID_CP2: case ID_CP3: case ID_CP4: case ID_CP5: CopyInfo(cmd - ID_CP1 + 1); break;
     case ID_PINTOP: g_cfg.pinTop = !g_cfg.pinTop; PutI(L"Options", L"PinTopmost", g_cfg.pinTop); break;
     case ID_PINALL: g_cfg.pinAll = !g_cfg.pinAll; PutI(L"Options", L"PinAllDesktops", g_cfg.pinAll); break;
     case ID_RAISE: g_cfg.raisePinned = !g_cfg.raisePinned; PutI(L"Options", L"RaisePinned", g_cfg.raisePinned); break;
@@ -1597,17 +1798,7 @@ static void HandleCmd(int cmd, MonBtn *b) {
     case ID_EXIT: DestroyWindow(g_ctl); break;
     }
 }
-static void ShowMenu(MonBtn *b) {
-    HWND f = GetForegroundWindow();
-    if (f && !IsOurs(f)) g_prevFg = f;
-    HMENU m = CreatePopupMenu();
-    int i = 0;
-    if (BuildSub(m, &i, 0)) AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-
-    int pinned = 0;
-    if (g_prevFg && IsWindow(g_prevFg) && !BadClass(g_prevFg)) pinned = IsPinned(GetAncestor(g_prevFg, GA_ROOT));
-    AppendMenuW(m, MF_STRING, ID_PIN, pinned ? L"Открепить активное окно" : L"Закрепить активное окно");
-
+static HMENU BuildSettingsMenu(MonBtn *b) {
     HMENU s = CreatePopupMenu(), mm = CreatePopupMenu();
     AppendMenuW(s, MF_STRING, ID_APPEAR, L"Внешний вид…");
     AppendMenuW(s, MF_STRING, ID_CLICK, L"Действие левого клика…");
@@ -1649,6 +1840,33 @@ static void ShowMenu(MonBtn *b) {
     if (g_debug) AppendMenuW(s, MF_STRING, ID_COPYLOG, L"Скопировать журнал в буфер обмена");
     AppendMenuW(s, MF_STRING, ID_OPENINI, L"Открыть файл настроек (.ini)");
     AppendMenuW(s, MF_STRING, ID_RELOAD, L"Перечитать настройки");
+    return s;
+}
+
+static void ShowMenu(MonBtn *b) {
+    HWND f = GetForegroundWindow();
+    if (f && !IsOurs(f)) g_prevFg = f;
+    HMENU m = CreatePopupMenu();
+    int i = 0;
+    if (BuildSub(m, &i, 0)) AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+
+    AppendMenuW(m, MF_STRING | (g_cfg.show ? MF_CHECKED : 0), ID_TOGGLE, ShowLabel());
+    int pinned = 0;
+    if (g_prevFg && IsWindow(g_prevFg) && !BadClass(g_prevFg)) pinned = IsPinned(GetAncestor(g_prevFg, GA_ROOT));
+    AppendMenuW(m, MF_STRING, ID_PIN, pinned ? L"Открепить активное окно" : L"Закрепить активное окно");
+    {
+        UINT gr = (g_prevFg && IsWindow(g_prevFg) && !BadClass(g_prevFg) && !IsOurs(g_prevFg)) ? 0 : MF_GRAYED;
+        HMENU cm = CreatePopupMenu();
+        AppendMenuW(cm, MF_STRING | gr, ID_CP1, L"Заголовок активного окна");
+        AppendMenuW(cm, MF_STRING | gr, ID_CP2, L"Имя exe активного окна");
+        AppendMenuW(cm, MF_STRING | gr, ID_CP3, L"Имя exe активного окна с аргументами");
+        AppendMenuW(cm, MF_STRING | gr, ID_CP4, L"Полный путь к exe активного окна");
+        AppendMenuW(cm, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(cm, MF_STRING | gr, ID_CP5, L"Открыть в проводнике расположение exe активного окна");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)cm, L"Скопировать");
+    }
+
+    HMENU s = BuildSettingsMenu(b);
     AppendMenuW(m, MF_POPUP, (UINT_PTR)s, L"Настройки");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_GRAYED | MF_STRING, 0, L"CornerBtn версия " APPVER);
@@ -1742,15 +1960,39 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     return DefWindowProcW(h, m, w, l);
 }
+static void ShowTrayMenu(void) {
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | (g_cfg.show ? MF_CHECKED : 0), ID_TOGGLE, ShowLabel());
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)BuildSettingsMenu(NULL), L"Настройки");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_GRAYED | MF_STRING, 0, L"CornerBtn версия " APPVER);
+    AppendMenuW(m, MF_STRING, ID_EXIT, L"Выход");
+    POINT pt;
+    GetCursorPos(&pt);
+    g_inMenu = 1;
+    SetForegroundWindow(g_ctl);
+    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_ctl, NULL);
+    PostMessageW(g_ctl, WM_NULL, 0, 0);
+    g_inMenu = 0;
+    DestroyMenu(m);
+    if (cmd) HandleCmd(cmd, NULL);
+}
 static LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (g_wmTaskbar && m == g_wmTaskbar) { TrayAdd(); return 0; } /* проводник перезапущен */
     switch (m) {
+    case WM_TRAY:
+        if (g_modal) return 0;
+        if (l == WM_LBUTTONUP) ToggleShow();
+        else if (l == WM_RBUTTONUP || l == WM_CONTEXTMENU) ShowTrayMenu();
+        return 0;
     case WM_DISPLAYCHANGE: SetTimer(h, 9, 700, NULL); return 0;
     case WM_TIMER:
         if (w == 9) { KillTimer(h, 9); SyncMonitors(); }
         else if (w == 2) Reassert();
         else if (w == 3) { UpdateExclusion(); CheckDesktopSwitch(); }
         return 0;
-    case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_DESTROY: TrayRemove(); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(h, m, w, l);
 }
@@ -1814,12 +2056,17 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
     wc.lpszClassName = L"CBCtl";
     RegisterClassExW(&wc);
 
+    g_wmTaskbar = RegisterWindowMessageW(L"TaskbarCreated");
     g_ctl = CreateWindowExW(WS_EX_TOOLWINDOW, L"CBCtl", APPNAME, WS_POPUP, 0, 0, 0, 0, NULL, NULL, hi, NULL);
     if (!g_ctl) return 1;
     SyncMonitors();
     if (g_nmb == 0) return 1;
     if (g_debug) { DeleteFileW(g_log); LogStartup(); }
     if (fresh) SaveAll();
+    if (!TrayAdd() && !g_cfg.show) { /* без значка в трее скрытые кнопки не вернуть */
+        g_cfg.show = 1;
+        for (int i = 0; i < g_nmb; i++) UpdateVis(g_mb[i]);
+    }
     SetTimer(g_ctl, 2, 1000, NULL); /* держать кнопки поверх всех */
     SetTimer(g_ctl, 3, 300, NULL);  /* проверка исключений */
 
