@@ -19,8 +19,16 @@ jobs:
 
       - name: Install mingw-w64
         run: |
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+          export DEBIAN_FRONTEND=noninteractive
+          for i in 1 2 3 4; do
+            echo "attempt $i"
+            sudo timeout 60 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update || true
+            if sudo timeout 150 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64; then
+              break
+            fi
+            sleep 5
+          done
+          x86_64-w64-mingw32-gcc --version | head -1
 
       - name: Build CornerBtn.exe
         working-directory: src
