@@ -15,6 +15,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <servprov.h>
 #include <oleauto.h>
 #include <dwmapi.h>
@@ -25,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.5.0"
+#define APPVER L"2.5.1"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 3
@@ -1048,6 +1049,17 @@ static void Reassert(void) {
 }
 
 /* ---------- запуск записей меню, иконки в меню, подсказки-аннотации ---------- */
+static int IsElevated(void) {
+    HANDLE tk;
+    TOKEN_ELEVATION te;
+    DWORD sz = 0;
+    int r = 0;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tk)) {
+        if (GetTokenInformation(tk, TokenElevation, &te, sizeof te, &sz)) r = te.TokenIsElevated ? 1 : 0;
+        CloseHandle(tk);
+    }
+    return r;
+}
 static int TokenSplit(const wchar_t *s, wchar_t *tok, int n, const wchar_t **rest) {
     int k = 0;
     while (*s && iswspace(*s)) s++;
@@ -1208,21 +1220,72 @@ static HICON ShellIcon(const wchar_t *path, int isDir) {
     if (!SHGetFileInfoW(full, attr, &fi, sizeof fi, fl)) return NULL;
     return fi.hIcon;
 }
-static HICON IconFor(const Entry *e, int sec) {
-    HICON ic = NULL;
-    if (e->icon[0]) ic = ManualIcon(e->icon);
-    if (ic) return ic;
-    if (e->type == 1) {
-        SHSTOCKICONINFO si;
-        memset(&si, 0, sizeof si);
-        si.cbSize = sizeof si;
-        if (SUCCEEDED(SHGetStockIconInfo(SIID_FOLDER, SHGSI_ICON | SHGSI_SMALLICON, &si))) return si.hIcon;
-        return NULL;
+/* проверка и приведение картинки от проводника к виду, который понимает меню (32 бита, альфа предумножена) */
+static int FixShellBmp(HBITMAP bm) {
+    DIBSECTION ds;
+    int w = GetSystemMetrics(SM_CXSMICON), h = GetSystemMetrics(SM_CYSMICON);
+    if (GetObject(bm, sizeof ds, &ds) < (int)sizeof(BITMAP)) return 0;
+    if (ds.dsBm.bmWidth != w || abs(ds.dsBm.bmHeight) != h || ds.dsBm.bmBitsPixel != 32 || !ds.dsBm.bmBits) return 0;
+    BYTE *p = (BYTE *)ds.dsBm.bmBits;
+    int any = 0, straight = 0;
+    for (int i = 0; i < w * h; i++) {
+        BYTE b = p[i * 4], g = p[i * 4 + 1], r = p[i * 4 + 2], a = p[i * 4 + 3];
+        if (a | r | g | b) any = 1;
+        if (r > a || g > a || b > a) straight = 1;
     }
-    if (!e->action[0] || e->action[0] == L'@') return NULL;
-    wchar_t p[1100];
-    ExpandEnvironmentStringsW(e->action, p, 1100);
-    return ShellIcon(p, sec == SEC_FOLDER);
+    if (!any) return 0;
+    if (straight)
+        for (int i = 0; i < w * h; i++) {
+            BYTE a = p[i * 4 + 3];
+            p[i * 4] = (BYTE)(p[i * 4] * a / 255);
+            p[i * 4 + 1] = (BYTE)(p[i * 4 + 1] * a / 255);
+            p[i * 4 + 2] = (BYTE)(p[i * 4 + 2] * a / 255);
+        }
+    return 1;
+}
+HRESULT WINAPI SHCreateItemFromParsingName(PCWSTR pszPath, IBindCtx *pbc, REFIID riid, void **ppv);
+/* иконка так, как её рисует сам проводник (с альфа-каналом нужного размера) */
+static HBITMAP ShellItemBmp(const wchar_t *path) {
+    IShellItemImageFactory *f = NULL;
+    HBITMAP bm = NULL;
+    if (SUCCEEDED(SHCreateItemFromParsingName(path, NULL, &IID_IShellItemImageFactory, (void **)&f)) && f) {
+        SIZE sz = { GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON) };
+        if (FAILED(f->lpVtbl->GetImage(f, sz, SIIGBF_ICONONLY, &bm))) bm = NULL;
+        f->lpVtbl->Release(f);
+        if (bm && !FixShellBmp(bm)) { DeleteObject(bm); bm = NULL; } /* пустая или неподходящая картинка: запасной путь */
+    }
+    return bm;
+}
+static HBITMAP BmpForPath(const wchar_t *path, int isDir) {
+    wchar_t full[MAX_PATH * 2];
+    int remote = (path[0] == L'\\' && path[1] == L'\\');
+    if (!remote && path[0] && path[1] == L':') {
+        wchar_t root[4] = { path[0], L':', L'\\', 0 };
+        if (GetDriveTypeW(root) == DRIVE_REMOTE) remote = 1;
+    }
+    cp(full, WSZ(full), path);
+    if (!remote && !wcschr(path, L'\\') && !wcschr(path, L':')) { /* просто имя программы: ищем в PATH */
+        if (!SearchPathW(NULL, path, NULL, MAX_PATH * 2, full, NULL) && !SearchPathW(NULL, path, L".exe", MAX_PATH * 2, full, NULL)) full[0] = 0;
+    }
+    if (!remote && full[0] && GetFileAttributesW(full) != INVALID_FILE_ATTRIBUTES) {
+        HBITMAP b = ShellItemBmp(full);
+        if (b) return b;
+    }
+    HICON ic = ShellIcon(path, isDir);
+    HBITMAP bm = ic ? BmpFromIcon(ic) : NULL;
+    if (ic) DestroyIcon(ic);
+    return bm;
+}
+static HICON StockIconFor(const wchar_t *action) { /* значки для встроенных действий */
+    SHSTOCKICONID id;
+    if (!wcscmp(action, L"@lock")) id = SIID_LOCK;
+    else if (!wcscmp(action, L"@desktop") || !wcscmp(action, L"@mondesk") || !wcscmp(action, L"@minall")) id = SIID_DESKTOPPC;
+    else return NULL;
+    SHSTOCKICONINFO si;
+    memset(&si, 0, sizeof si);
+    si.cbSize = sizeof si;
+    if (SUCCEEDED(SHGetStockIconInfo(id, SHGSI_ICON | SHGSI_SMALLICON, &si))) return si.hIcon;
+    return NULL;
 }
 static HBITMAP EntryBmp(const Entry *e, int sec) {
     if (e->type == 2) return NULL;
@@ -1231,8 +1294,29 @@ static HBITMAP EntryBmp(const Entry *e, int sec) {
     key[899] = 0;
     for (int i = 0; i < g_nic; i++) if (!wcscmp(g_ic[i].key, key)) return g_ic[i].bmp;
     if (g_nic >= ICACHE_MAX) return NULL;
-    HICON ic = IconFor(e, sec);
-    HBITMAP bm = ic ? BmpFromIcon(ic) : NULL;
+    HBITMAP bm = NULL;
+    HICON ic = NULL;
+    if (e->icon[0]) ic = ManualIcon(e->icon);
+    if (!ic) {
+        if (e->type == 1) {
+            SHSTOCKICONINFO si;
+            memset(&si, 0, sizeof si);
+            si.cbSize = sizeof si;
+            if (SUCCEEDED(SHGetStockIconInfo(SIID_FOLDER, SHGSI_ICON | SHGSI_SMALLICON, &si))) ic = si.hIcon;
+        } else if (e->action[0]) {
+            wchar_t p[1100];
+            if (e->action[0] == L'@') {
+                if (!wcscmp(e->action, L"@taskmgr")) {
+                    ExpandEnvironmentStringsW(L"%SystemRoot%\\System32\\Taskmgr.exe", p, 1100);
+                    bm = BmpForPath(p, 0);
+                } else ic = StockIconFor(e->action);
+            } else {
+                ExpandEnvironmentStringsW(e->action, p, 1100);
+                bm = BmpForPath(p, sec == SEC_FOLDER);
+            }
+        }
+    }
+    if (!bm && ic) bm = BmpFromIcon(ic);
     if (ic) DestroyIcon(ic);
     cp(g_ic[g_nic].key, 900, key);
     g_ic[g_nic].bmp = bm;
@@ -1665,6 +1749,7 @@ static void CopyInfo(int which) {
 static void LogStartup(void) {
     wchar_t bld[120];
     WinBuild(bld, 120);
+    Log(L"Права процесса: %ls", IsElevated() ? L"АДМИНИСТРАТОР (перетаскивание из проводника блокируется Windows)" : L"обычный пользователь");
     Log(L"=== CornerBtn: журнал включён. %ls. VirtualDesktopManager: %ls (hr=0x%08lX)", bld, g_vdm ? L"да" : L"НЕТ", (unsigned long)g_vdmHr);
     for (int i = 0; i < g_nmb; i++)
         Log(L"  монитор %d: %ls %ld,%ld..%ld,%ld основной=%d включён=%d угол=%d dx=%d dy=%d", i + 1, g_mb[i]->dev,
@@ -1754,21 +1839,114 @@ static void EntAutoName(EntDlg *a, const wchar_t *path) {
     BaseName(path, nm, 128, IsDirPath(path));
     SetWindowTextW(a->eName, nm);
 }
+/* OLE-приёмник файлов (IDropTarget): надёжный способ принимать перетаскивание из проводника */
+enum { DT_TREE = 1, DT_EDIT = 2, DT_PAGETREE = 3 };
+typedef struct { IDropTargetVtbl *lpVtbl; LONG ref; HWND hwnd; int kind; void *ctx; int ok; } DT;
+static void TreeDropEx(HWND tree, HDROP hd, POINT pt);
+static void EditDropApply(HWND h, EntDlg *a, HDROP hd) {
+    wchar_t f[MAX_PATH * 2];
+    if (!DragQueryFileW(hd, 0, f, MAX_PATH * 2)) return;
+    if (a && a->sec == SEC_FOLDER && h == a->ePath && !IsDirPath(f)) { /* для папок: вместо файла берём его папку */
+        wchar_t *sl = wcsrchr(f, L'\\');
+        if (sl) { if (sl - f <= 2) sl[1] = 0; else *sl = 0; }
+    }
+    SetWindowTextW(h, f);
+    if (a && h == a->ePath) EntAutoName(a, f);
+}
+static int DtHasFiles(IDataObject *o) {
+    FORMATETC fe = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    return o && o->lpVtbl->QueryGetData(o, &fe) == S_OK;
+}
+static HRESULT WINAPI Dt_QI(IDropTarget *t, REFIID r, void **o) {
+    if (IsEqualIID(r, &IID_IUnknown) || IsEqualIID(r, &IID_IDropTarget)) { *o = t; ((DT *)t)->ref++; return S_OK; }
+    *o = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG WINAPI Dt_AddRef(IDropTarget *t) { return (ULONG)++((DT *)t)->ref; }
+static ULONG WINAPI Dt_Release(IDropTarget *t) {
+    DT *d = (DT *)t;
+    LONG r = --d->ref;
+    if (!r) free(d);
+    return (ULONG)r;
+}
+static void DtHilite(DT *d, POINTL ptl, int on) {
+    if (d->kind != DT_TREE) return;
+    HTREEITEM hit = NULL;
+    if (on) {
+        TVHITTESTINFO ht;
+        memset(&ht, 0, sizeof ht);
+        ht.pt.x = ptl.x;
+        ht.pt.y = ptl.y;
+        ScreenToClient(d->hwnd, &ht.pt);
+        hit = TreeView_HitTest(d->hwnd, &ht);
+    }
+    TreeView_SelectDropTarget(d->hwnd, hit);
+}
+static HRESULT WINAPI Dt_Enter(IDropTarget *t, IDataObject *o, DWORD ks, POINTL pt, DWORD *eff) {
+    DT *d = (DT *)t;
+    (void)ks;
+    d->ok = DtHasFiles(o);
+    *eff = d->ok ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    DtHilite(d, pt, d->ok);
+    return S_OK;
+}
+static HRESULT WINAPI Dt_Over(IDropTarget *t, DWORD ks, POINTL pt, DWORD *eff) {
+    DT *d = (DT *)t;
+    (void)ks;
+    *eff = d->ok ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    DtHilite(d, pt, d->ok);
+    return S_OK;
+}
+static HRESULT WINAPI Dt_Leave(IDropTarget *t) {
+    POINTL z = { 0, 0 };
+    DtHilite((DT *)t, z, 0);
+    return S_OK;
+}
+static HRESULT WINAPI Dt_Drop(IDropTarget *t, IDataObject *o, DWORD ks, POINTL ptl, DWORD *eff) {
+    DT *d = (DT *)t;
+    FORMATETC fe = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    STGMEDIUM stg;
+    (void)ks;
+    DtHilite(d, ptl, 0);
+    *eff = DROPEFFECT_NONE;
+    if (!d->ok || !o) return S_OK;
+    memset(&stg, 0, sizeof stg);
+    if (SUCCEEDED(o->lpVtbl->GetData(o, &fe, &stg)) && stg.tymed == TYMED_HGLOBAL) {
+        HDROP hd = (HDROP)stg.hGlobal;
+        POINT pt = { ptl.x, ptl.y };
+        Log(L"drop: kind=%d файлов=%u", d->kind, DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0));
+        if (d->kind == DT_TREE) { ScreenToClient(d->hwnd, &pt); TreeDropEx(d->hwnd, hd, pt); }
+        else if (d->kind == DT_PAGETREE) { POINT far_ = { -1, -1 }; TreeDropEx((HWND)d->ctx, hd, far_); }
+        else EditDropApply(d->hwnd, (EntDlg *)d->ctx, hd);
+        ReleaseStgMedium(&stg);
+        *eff = DROPEFFECT_COPY;
+    }
+    return S_OK;
+}
+static IDropTargetVtbl g_dtv = { Dt_QI, Dt_AddRef, Dt_Release, Dt_Enter, Dt_Over, Dt_Leave, Dt_Drop };
+static int RegDrop(HWND w, int kind, void *ctx) { /* 1 = OLE, 0 = запасной вариант WM_DROPFILES */
+    ChangeWindowMessageFilterEx(w, WM_DROPFILES, MSGFLT_ALLOW, NULL);
+    ChangeWindowMessageFilterEx(w, 0x0049 /* WM_COPYGLOBALDATA */, MSGFLT_ALLOW, NULL);
+    DT *d = (DT *)calloc(1, sizeof(DT));
+    if (!d) { DragAcceptFiles(w, TRUE); return 0; }
+    d->lpVtbl = &g_dtv;
+    d->ref = 1;
+    d->hwnd = w;
+    d->kind = kind;
+    d->ctx = ctx;
+    HRESULT hr = RegisterDragDrop(w, (IDropTarget *)d);
+    Log(L"RegisterDragDrop hwnd=%p kind=%d hr=0x%08lX", (void *)w, kind, (unsigned long)hr);
+    Dt_Release((IDropTarget *)d); /* своя ссылка не нужна: регистрация держит свою */
+    if (FAILED(hr)) { DragAcceptFiles(w, TRUE); return 0; }
+    return 1;
+}
 static LRESULT CALLBACK DropEditSub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR ref) {
-    if (m == WM_DROPFILES) {
-        wchar_t f[MAX_PATH * 2];
-        EntDlg *a = (EntDlg *)ref;
-        if (DragQueryFileW((HDROP)w, 0, f, MAX_PATH * 2)) {
-            if (a && a->sec == SEC_FOLDER && h == a->ePath && !IsDirPath(f)) { /* для папок: вместо файла берём его папку */
-                wchar_t *sl = wcsrchr(f, L'\\');
-                if (sl) { if (sl - f <= 2) sl[1] = 0; else *sl = 0; }
-            }
-            SetWindowTextW(h, f);
-            if (a && h == a->ePath) EntAutoName(a, f);
-        }
+    if (m == WM_DROPFILES) { /* запасной путь, если OLE недоступен */
+        EditDropApply(h, (EntDlg *)ref, (HDROP)w);
         DragFinish((HDROP)w);
         return 0;
     }
+    if (m == WM_DESTROY) RevokeDragDrop(h);
     if (m == WM_NCDESTROY) RemoveWindowSubclass(h, DropEditSub, id);
     return DefSubclassProc(h, m, w, l);
 }
@@ -1921,7 +2099,7 @@ static int EditEntryDlg(int sec, int type, Entry *e, const wchar_t *title, HWND 
         }
     }
     HWND dropTargets[3] = { a.ePath, a.eIcon, a.eInterp };
-    for (int i = 0; i < 3; i++) if (dropTargets[i]) { DragAcceptFiles(dropTargets[i], TRUE); SetWindowSubclass(dropTargets[i], DropEditSub, 1, (DWORD_PTR)&a); }
+    for (int i = 0; i < 3; i++) if (dropTargets[i]) { SetWindowSubclass(dropTargets[i], DropEditSub, 1, (DWORD_PTR)&a); RegDrop(dropTargets[i], DT_EDIT, &a); }
     Btn(h, L"OK", 328, y, 85, 28, IDOK, 1);
     Btn(h, L"Отмена", 423, y, 85, 28, IDCANCEL, 0);
     if (!RunModal(&a.d, owner)) return 0;
@@ -2101,13 +2279,11 @@ static void TreeCmd(HWND owner, int id) {
 }
 
 /* перетаскивание файлов/папок из проводника прямо в дерево */
-static void TreeDrop(HWND tree, HDROP hd) {
+static void TreeDropEx(HWND tree, HDROP hd, POINT pt) {
     int sec = -1;
     for (int s = 0; s < NSEC; s++) if (g_trees[s] == tree) sec = s;
-    if (sec < 0) { DragFinish(hd); return; }
+    if (sec < 0) return;
     g_cur = sec;
-    POINT pt;
-    DragQueryPoint(hd, &pt);
     TVHITTESTINFO ht;
     memset(&ht, 0, sizeof ht);
     ht.pt = pt;
@@ -2145,13 +2321,19 @@ static void TreeDrop(HWND tree, HDROP hd) {
         last = pos;
         pos++;
     }
-    DragFinish(hd);
     Normalize();
     Rebuild(last);
+}
+static void TreeDrop(HWND tree, HDROP hd) { /* запасной путь WM_DROPFILES */
+    POINT pt;
+    DragQueryPoint(hd, &pt);
+    TreeDropEx(tree, hd, pt);
+    DragFinish(hd);
 }
 static LRESULT CALLBACK TreeSub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR ref) {
     (void)ref;
     if (m == WM_DROPFILES) { TreeDrop(h, (HDROP)w); return 0; }
+    if (m == WM_DESTROY) RevokeDragDrop(h);
     if (m == WM_NCDESTROY) RemoveWindowSubclass(h, TreeSub, id);
     return DefSubclassProc(h, m, w, l);
 }
@@ -2243,8 +2425,9 @@ static void PgTree(SetDlg *s, int sec, HWND pg, int PW, int PH) {
     HWND tr = Mk(pg, L"SysTreeView32", L"", WS_TABSTOP | TVS_HASLINES | TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE,
                  8, 8, PW - 196, PH - 62, 701 + sec);
     g_trees[sec] = tr;
-    DragAcceptFiles(tr, TRUE);
     SetWindowSubclass(tr, TreeSub, 1, 0);
+    RegDrop(tr, DT_TREE, NULL);
+    RegDrop(pg, DT_PAGETREE, tr); /* бросить можно и на пустое место вкладки: пункт добавится в конец */
     int x = PW - 180, y = 8;
     Btn(pg, L"↑  Вверх", x, y, 172, 28, 411, 0); y += 32;
     Btn(pg, L"↓  Вниз", x, y, 172, 28, 412, 0); y += 32;
@@ -2255,7 +2438,8 @@ static void PgTree(SetDlg *s, int sec, HWND pg, int PW, int PH) {
     Btn(pg, L"Добавить разделитель", x, y, 172, 28, 417, 0); y += 40;
     Btn(pg, L"Изменить…", x, y, 172, 28, 418, 0); y += 32;
     Btn(pg, L"Удалить", x, y, 172, 28, 419, 0);
-    Lbl(pg, hint[sec], 8, PH - 48, PW - 16, 44);
+    Lbl(pg, IsElevated() ? L"ВНИМАНИЕ: CornerBtn запущен от имени администратора, поэтому Windows блокирует перетаскивание из обычного проводника. Перезапустите программу без повышения прав."
+                         : hint[sec], 8, PH - 48, PW - 16, 44);
     g_cur = sec;
     Rebuild(-1);
 }
@@ -2761,7 +2945,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
     HANDLE mtx = CreateMutexW(NULL, FALSE, L"Local\\CornerBtn_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
     (void)mtx;
-    CoInitialize(NULL);
+    OleInitialize(NULL); /* OLE нужен для перетаскивания файлов (IDropTarget) */
     INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_TREEVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_TAB_CLASSES };
     InitCommonControlsEx(&icc);
 
@@ -2845,6 +3029,6 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    CoUninitialize();
+    OleUninitialize();
     return 0;
 }
