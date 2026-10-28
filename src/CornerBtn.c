@@ -26,12 +26,12 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.5.1"
+#define APPVER L"2.6.0"
 #define IDI_APP 100
 #define MAXE 300
-#define NSEC 3
+#define NSEC 4
 #define ID_ENT0 1000
-enum { SEC_PROG = 0, SEC_SCRIPT = 1, SEC_FOLDER = 2 };
+enum { SEC_PROG = 0, SEC_SCRIPT = 1, SEC_FOLDER = 2, SEC_FILES = 3 };
 #define MAXD 7
 #define MAXMON 8
 #define MAXLIST 64
@@ -74,7 +74,7 @@ static HTREEITEM g_htis[NSEC][MAXE];
 #define g_tree g_trees[g_cur]
 #define g_hti g_htis[g_cur]
 static Act g_click, g_dbl, g_mid;
-static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; } g_cfg;
+static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; } g_cfg;
 static wchar_t g_excl[MAXLIST][64], g_remote[MAXLIST][64];
 static int g_nexcl, g_nremote;
 static HICON g_icon;
@@ -232,7 +232,7 @@ static void SaveList(const wchar_t *sec, wchar_t (*arr)[64], int n) {
 }
 
 /* ---------- разделы меню (Программы / Скрипты / Папки): хранение в ini ---------- */
-static const wchar_t *g_secName[NSEC] = { L"Programs", L"Scripts", L"Folders" };
+static const wchar_t *g_secName[NSEC] = { L"Programs", L"Scripts", L"Folders", L"Files" };
 static wchar_t g_line[7000];
 
 static void EscCat(wchar_t *dst, size_t n, const wchar_t *s) {
@@ -379,6 +379,7 @@ static void LoadAll(void) {
     g_cfg.keepTop = GetI(L"Options", L"KeepTopmost", 0) ? 1 : 0;
     g_cfg.raisePinned = GetI(L"Options", L"RaisePinned", 1) ? 1 : 0;
     g_cfg.show = GetI(L"Options", L"ShowButtons", 1) ? 1 : 0;
+    GetS(L"Options", L"TextEditor", L"", g_cfg.editor, MAX_PATH * 2);
     g_debug = GetI(L"Options", L"Debug", 0) ? 1 : 0;
     GetS(L"Button", L"Color", L"3399FF", b, 64);
     g_cfg.color = ParseColor(b, RGB(0x33, 0x99, 0xFF));
@@ -425,6 +426,7 @@ static void SaveCfg(void) {
     PutI(L"Options", L"RaisePinned", g_cfg.raisePinned);
     PutI(L"Options", L"Debug", g_debug);
     PutI(L"Options", L"ShowButtons", g_cfg.show);
+    PutS(L"Options", L"TextEditor", g_cfg.editor);
 }
 /* ---------- настройки мониторов ---------- */
 static void MonKey(const wchar_t *dev, wchar_t *out) {
@@ -1130,10 +1132,54 @@ static void RunFolder(const Entry *e) {
     }
     ShellExecuteW(NULL, L"open", path, NULL, NULL, SW_SHOWNORMAL);
 }
+static int IsScriptExt(const wchar_t *path) {
+    static const wchar_t *const ext[] = { L".bat", L".cmd", L".vbs", L".vbe", L".js", L".jse", L".wsf", L".wsh", L".ps1", L".py", L".pyw", L".reg", NULL };
+    const wchar_t *dot = wcsrchr(path, L'.');
+    wchar_t e[16];
+    if (!dot || wcslen(dot) > 8) return 0;
+    cp(e, 16, dot);
+    for (wchar_t *c = e; *c; c++) *c = (wchar_t)towlower(*c);
+    return ExtIn(e, ext);
+}
+static void ShellRun(const wchar_t *progSpec, const wchar_t *file) { /* "программа [параметры]" + файл */
+    wchar_t tok[1100], exe[1100], params[1700];
+    const wchar_t *rest = L"";
+    TokenSplit(progSpec, tok, 1100, &rest);
+    ExpandEnvironmentStringsW(tok, exe, 1100);
+    _snwprintf(params, 1700, L"%ls \"%ls\"", rest, file);
+    params[1699] = 0;
+    Trim(params);
+    HINSTANCE r = ShellExecuteW(NULL, L"open", exe, params, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)r <= 32) {
+        wchar_t msg[1400];
+        _snwprintf(msg, 1400, L"Не удалось запустить программу:\n%ls", exe);
+        msg[1399] = 0;
+        MessageBoxW(NULL, msg, APPNAME, MB_ICONWARNING);
+    }
+}
+static void OpenInEditor(const wchar_t *path) { /* текстовый редактор из настроек, по умолчанию Блокнот */
+    ShellRun(g_cfg.editor[0] ? g_cfg.editor : L"notepad.exe", path);
+}
+static void RunFileEntry(const Entry *e) {
+    wchar_t path[1100];
+    ExpandEnvironmentStringsW(e->action, path, 1100);
+    if (!path[0]) return;
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        wchar_t msg[1300];
+        _snwprintf(msg, 1300, L"Файл не найден:\n%ls", path);
+        msg[1299] = 0;
+        MessageBoxW(NULL, msg, APPNAME, MB_ICONWARNING);
+        return;
+    }
+    if (e->interp[0]) { ShellRun(e->interp, path); return; } /* открыть заданной программой */
+    if (IsScriptExt(path)) { OpenInEditor(path); return; }   /* скрипты из «Файлов» открываем в редакторе, а не запускаем */
+    ShellExecuteW(NULL, L"open", path, NULL, NULL, SW_SHOWNORMAL);
+}
 static void RunEntry(int sec, int idx, MonBtn *b) {
     Entry *e = &g_ent[sec][idx];
     if (sec == SEC_SCRIPT) RunScript(e);
     else if (sec == SEC_FOLDER) RunFolder(e);
+    else if (sec == SEC_FILES) RunFileEntry(e);
     else RunSpec(e->action, e->args, b);
 }
 
@@ -1358,9 +1404,11 @@ static void TipShow(const wchar_t *text, int x, int y) {
     SendMessageW(g_tip, TTM_TRACKPOSITION, 0, MAKELPARAM(x, y));
     SendMessageW(g_tip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&g_ti);
 }
+static HMENU g_selMenu; /* меню, в котором сейчас выделен пункт */
 static void OnMenuSelect(WPARAM w, LPARAM l) {
     UINT id = LOWORD(w), fl = HIWORD(w);
     HMENU hm = (HMENU)l;
+    if (hm) g_selMenu = hm;
     if (!hm || fl == 0xFFFF || (fl & (MF_POPUP | MF_SEPARATOR)) || !id) { TipHide(); return; }
     if (id >= ID_ENT0 && id < ID_ENT0 + NSEC * MAXE) {
         int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
@@ -1828,16 +1876,24 @@ static int BrowseDir(HWND owner, wchar_t *out) {
 }
 
 enum { ED_NAME = 601, ED_ACT, ED_PATH, ED_ARGS, ED_INTERP, ED_ICON, ED_NOTE, ED_ADMIN, ED_HIDE, ED_BFILE, ED_BDIR, ED_BINTERP, ED_BICON };
-typedef struct { Dlg d; int sec, type; Entry e; HWND eName, cb, ePath, eArgs, eInterp, eIcon, eNote, chAdmin, chHide; } EntDlg;
+typedef struct { Dlg d; int sec, type; Entry e; HWND eName, cb, ePath, eArgs, eInterp, eIcon, eNote, chAdmin, chHide; wchar_t lastAuto[128]; } EntDlg;
 
+/* имя из пути подставляется, только если поле пустое или в нём наша прошлая подстановка;
+   если пользователь ввёл имя сам, оно не трогается */
 static void EntAutoName(EntDlg *a, const wchar_t *path) {
-    wchar_t cur[128], nm[128];
-    if (!a->eName) return;
+    wchar_t cur[128], nm[128], pp[MAX_PATH * 2];
+    if (!a->eName || !path || !*path) return;
     GetWindowTextW(a->eName, cur, 128);
     Trim(cur);
-    if (cur[0]) return;
-    BaseName(path, nm, 128, IsDirPath(path));
+    if (cur[0] && wcscmp(cur, a->lastAuto)) return;
+    cp(pp, WSZ(pp), path);
+    Trim(pp);
+    size_t l = wcslen(pp);
+    if (l > 1 && pp[0] == L'"') { if (pp[l - 1] == L'"') pp[l - 1] = 0; memmove(pp, pp + 1, (wcslen(pp)) * sizeof(wchar_t)); }
+    BaseName(pp, nm, 128, IsDirPath(pp));
+    if (!nm[0]) return;
     SetWindowTextW(a->eName, nm);
+    cp(a->lastAuto, WSZ(a->lastAuto), nm);
 }
 /* OLE-приёмник файлов (IDropTarget): надёжный способ принимать перетаскивание из проводника */
 enum { DT_TREE = 1, DT_EDIT = 2, DT_PAGETREE = 3 };
@@ -1965,8 +2021,16 @@ static void EntCmd(Dlg *d, int id, int code) {
     case ED_ACT:
         if (code == CBN_SELCHANGE) EntEnable(a);
         break;
+    case ED_PATH:
+        if (code == EN_KILLFOCUS && a->ePath) { /* ушли из поля пути: подставить имя, если оно ещё не введено */
+            wchar_t pp[520];
+            GetWindowTextW(a->ePath, pp, 520);
+            Trim(pp);
+            if (pp[0]) EntAutoName(a, pp);
+        }
+        break;
     case ED_BFILE: {
-        const wchar_t *flt = a->sec == SEC_SCRIPT
+        const wchar_t *flt = a->sec == SEC_FILES ? L"Все файлы\0*.*\0" : a->sec == SEC_SCRIPT
             ? L"Скрипты\0*.bat;*.cmd;*.vbs;*.vbe;*.js;*.jse;*.wsf;*.wsh;*.ps1;*.py;*.pyw\0Все файлы\0*.*\0"
             : L"Программы и ярлыки\0*.exe;*.com;*.bat;*.cmd;*.lnk\0Все файлы\0*.*\0";
         if (BrowseOpen(d->h, flt, f, MAX_PATH)) { SetWindowTextW(a->ePath, f); EntAutoName(a, f); }
@@ -1990,6 +2054,12 @@ static void EntCmd(Dlg *d, int id, int code) {
         Entry *e = &a->e;
         GetWindowTextW(a->eName, e->name, 128);
         Trim(e->name);
+        if (!e->name[0] && a->type == 0 && a->ePath) { /* имя не введено: берём из пути */
+            wchar_t pp[520];
+            GetWindowTextW(a->ePath, pp, 520);
+            Trim(pp);
+            if (pp[0]) { EntAutoName(a, pp); GetWindowTextW(a->eName, e->name, 128); Trim(e->name); }
+        }
         if (!e->name[0]) { MessageBoxW(d->h, L"Введите название.", APPNAME, MB_ICONINFORMATION); return; }
         GetWindowTextW(a->eIcon, e->icon, 260);
         Trim(e->icon);
@@ -2008,12 +2078,15 @@ static void EntCmd(Dlg *d, int id, int code) {
             } else {
                 GetWindowTextW(a->ePath, e->action, 520);
                 Trim(e->action);
-                if (!e->action[0]) { MessageBoxW(d->h, a->sec == SEC_SCRIPT ? L"Укажите путь к скрипту." : L"Укажите путь к папке.", APPNAME, MB_ICONINFORMATION); return; }
+                if (!e->action[0]) { MessageBoxW(d->h, a->sec == SEC_SCRIPT ? L"Укажите путь к скрипту." : (a->sec == SEC_FILES ? L"Укажите путь к файлу." : L"Укажите путь к папке."), APPNAME, MB_ICONINFORMATION); return; }
                 if (a->sec == SEC_SCRIPT) {
                     GetWindowTextW(a->eArgs, e->args, 260);
                     GetWindowTextW(a->eInterp, e->interp, 260);
                     Trim(e->interp);
                     e->flags = (Chk(a->chAdmin) ? 1 : 0) | (Chk(a->chHide) ? 2 : 0);
+                } else if (a->sec == SEC_FILES) {
+                    GetWindowTextW(a->eInterp, e->interp, 260);
+                    Trim(e->interp);
                 }
             }
         }
@@ -2031,7 +2104,7 @@ static int EditEntryDlg(int sec, int type, Entry *e, const wchar_t *title, HWND 
     a.sec = sec;
     a.type = type;
     a.e = *e;
-    int rows = (type == 1) ? 2 : (sec == SEC_FOLDER ? 4 : 6);
+    int rows = (type == 1) ? 2 : (sec == SEC_FOLDER ? 4 : (sec == SEC_FILES ? 5 : 6));
     int ch = 12 + rows * 56 + ((sec == SEC_SCRIPT && type == 0) ? 54 : 0) + 44;
     NewDlg(&a.d, title, 520, ch);
     a.d.oncmd = EntCmd;
@@ -2051,19 +2124,21 @@ static int EditEntryDlg(int sec, int type, Entry *e, const wchar_t *title, HWND 
         }
         Lbl(h, sec == SEC_PROG ? L"Путь, ссылка или программа (можно перетащить файл сюда):"
                 : (sec == SEC_SCRIPT ? L"Путь к скрипту (.bat, .cmd, .vbs, .js, .wsf, .ps1, .py … можно перетащить сюда):"
-                                     : L"Путь к папке (можно перетащить папку сюда):"), 12, y, 496, 18);
+                : (sec == SEC_FILES ? L"Путь к файлу (можно перетащить файл сюда):"
+                                     : L"Путь к папке (можно перетащить папку сюда):")), 12, y, 496, 18);
         a.ePath = Edt(h, 12, y + 20, 340, 24, ED_PATH);
         if (sec == SEC_FOLDER) Btn(h, L"Выбрать папку…", 360, y + 20, 148, 24, ED_BDIR, 0);
-        else if (sec == SEC_SCRIPT) Btn(h, L"Выбрать файл…", 360, y + 20, 148, 24, ED_BFILE, 0);
+        else if (sec == SEC_SCRIPT || sec == SEC_FILES) Btn(h, L"Выбрать файл…", 360, y + 20, 148, 24, ED_BFILE, 0);
         else { Btn(h, L"Файл…", 360, y + 20, 70, 24, ED_BFILE, 0); Btn(h, L"Папка…", 436, y + 20, 72, 24, ED_BDIR, 0); }
         y += 56;
-        if (sec != SEC_FOLDER) {
+        if (sec != SEC_FOLDER && sec != SEC_FILES) {
             Lbl(h, L"Аргументы (необязательно):", 12, y, 496, 18);
             a.eArgs = Edt(h, 12, y + 20, 496, 24, ED_ARGS);
             y += 56;
         }
-        if (sec == SEC_SCRIPT) {
-            Lbl(h, L"Интерпретатор (пусто — выбирается сам по расширению; можно «python.exe -u»):", 12, y, 496, 18);
+        if (sec == SEC_SCRIPT || sec == SEC_FILES) {
+            Lbl(h, sec == SEC_FILES ? L"Открыть программой (пусто — скрипты в текстовом редакторе, остальное как обычно):"
+                                    : L"Интерпретатор (пусто — выбирается сам по расширению; можно «python.exe -u»):", 12, y, 496, 18);
             a.eInterp = Edt(h, 12, y + 20, 340, 24, ED_INTERP);
             Btn(h, L"Обзор…", 360, y + 20, 148, 24, ED_BINTERP, 0);
             y += 56;
@@ -2184,7 +2259,7 @@ static int InsPos(int *depth) {
     return i + 1;
 }
 static void TreeCmd(HWND owner, int id) {
-    static const wchar_t *const newTitle[NSEC] = { L"Новая программа", L"Новый скрипт или команда", L"Новая папка быстрого доступа" };
+    static const wchar_t *const newTitle[NSEC] = { L"Новая программа", L"Новый скрипт или команда", L"Новая папка быстрого доступа", L"Новый файл" };
     int i = SelIdx(), ns = -1, chg = 0;
     switch (id) {
     case 411: /* вверх */
@@ -2339,7 +2414,7 @@ static LRESULT CALLBACK TreeSub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id,
 }
 
 /* ---------- окно настроек со вкладками ---------- */
-enum { TAB_PROG = 0, TAB_SCRIPT, TAB_FOLDER, TAB_APP, TAB_ACT, TAB_MON, TAB_PIN, TAB_EXCL, TAB_GEN, NTABS };
+enum { TAB_PROG = 0, TAB_SCRIPT, TAB_FOLDER, TAB_FILES, TAB_APP, TAB_ACT, TAB_MON, TAB_PIN, TAB_EXCL, TAB_GEN, NTABS };
 typedef struct {
     Dlg d;
     HWND tab, page[NTABS];
@@ -2351,7 +2426,7 @@ typedef struct {
     int mdx[MAXMON], mdy[MAXMON];
     HWND chPinTop, chPinAll, chRaise, chKeep, chLocal;
     HWND eExcl, eRemote;
-    HWND chAuto, chDebug;
+    HWND chAuto, chDebug, eEditor;
 } SetDlg;
 static Entry g_bak[NSEC][MAXE];
 static int g_bakn[NSEC];
@@ -2410,17 +2485,18 @@ static LRESULT CALLBACK PageProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-static const wchar_t *const g_tabName[NTABS] = { L"Программы", L"Скрипты и команды", L"Папки", L"Внешний вид", L"Действия кнопки", L"Мониторы", L"Закрепление окон", L"Исключения", L"Общее" };
+static const wchar_t *const g_tabName[NTABS] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Внешний вид", L"Действия кнопки", L"Мониторы", L"Закрепление окон", L"Исключения", L"Общее" };
 static const wchar_t *const g_actTitle[3] = { L"Левый клик", L"Двойной левый клик", L"Средняя кнопка (колёсико)" };
 static const wchar_t *const g_cornerName[4] = { L"Левый верхний угол", L"Правый верхний угол", L"Левый нижний угол", L"Правый нижний угол" };
 
 static void PgTree(SetDlg *s, int sec, HWND pg, int PW, int PH) {
     (void)s;
-    static const wchar_t *const addText[NSEC] = { L"Добавить программу…", L"Добавить скрипт…", L"Добавить папку…" };
+    static const wchar_t *const addText[NSEC] = { L"Добавить программу…", L"Добавить скрипт…", L"Добавить папку…", L"Добавить файл…" };
     static const wchar_t *const hint[NSEC] = {
         L"Перетащите сюда программы, ярлыки и любые файлы из проводника: пункты создадутся сами. Иконка берётся из файла. Двойной щелчок — изменить.",
         L"Перетащите сюда скрипты (.bat, .cmd, .vbs, .js, .wsf, .ps1, .py): пункты создадутся сами. Интерпретатор выбирается по расширению или задаётся вручную.",
-        L"Перетащите сюда папки из проводника. Категории (например «Фото») создаются кнопкой «Добавить категорию», папки кладутся внутрь категории."
+        L"Перетащите сюда папки из проводника. Категории (например «Фото») создаются кнопкой «Добавить категорию», папки кладутся внутрь категории.",
+        L"Перетащите сюда любые файлы из проводника для быстрого открытия. Скрипты из этого раздела открываются в текстовом редакторе (задаётся на вкладке «Общее»), остальные файлы — как обычно."
     };
     HWND tr = Mk(pg, L"SysTreeView32", L"", WS_TABSTOP | TVS_HASLINES | TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE,
                  8, 8, PW - 196, PH - 62, 701 + sec);
@@ -2536,10 +2612,14 @@ static void PgExcl(SetDlg *s, HWND pg, int PW, int PH) {
 static void PgGen(SetDlg *s, HWND pg) {
     s->chAuto = Chkbox(pg, L"Запускать вместе с Windows", 12, 16, 500, 901, AutoGet());
     s->chDebug = Chkbox(pg, L"Журнал диагностики (CornerBtn.log рядом с программой)", 12, 50, 600, 902, g_debug);
-    Btn(pg, L"Открыть файл настроек (.ini)", 12, 96, 300, 30, 903, 0);
-    Btn(pg, L"Перечитать настройки из .ini", 12, 134, 300, 30, 904, 0);
-    Btn(pg, L"Скопировать журнал в буфер обмена", 12, 172, 300, 30, 905, 0);
-    Lbl(pg, L"CornerBtn версия " APPVER L"  ·  github.com/thzszaund/FastButton-win", 12, 226, 700, 20);
+    Lbl(pg, L"Текстовый редактор для скриптов (пусто — Блокнот; можно с параметрами, например «notepad++.exe -multiInst»):", 12, 90, 740, 34);
+    s->eEditor = Edt(pg, 12, 126, 540, 24, 906);
+    SetWindowTextW(s->eEditor, g_cfg.editor);
+    Btn(pg, L"Обзор…", 560, 126, 110, 24, 907, 0);
+    Btn(pg, L"Открыть файл настроек (.ini)", 12, 176, 300, 30, 903, 0);
+    Btn(pg, L"Перечитать настройки из .ini", 12, 214, 300, 30, 904, 0);
+    Btn(pg, L"Скопировать журнал в буфер обмена", 12, 252, 300, 30, 905, 0);
+    Lbl(pg, L"CornerBtn версия " APPVER L"  ·  github.com/thzszaund/FastButton-win", 12, 306, 700, 20);
 }
 
 static int SetApply(SetDlg *s) {
@@ -2575,6 +2655,8 @@ static int SetApply(SetDlg *s) {
     g_cfg.localKeys = Chk(s->chLocal);
     EditToLines(s->eExcl, g_excl, &g_nexcl);
     EditToLines(s->eRemote, g_remote, &g_nremote);
+    GetWindowTextW(s->eEditor, g_cfg.editor, MAX_PATH * 2);
+    Trim(g_cfg.editor);
     if (Chk(s->chAuto) != AutoGet()) AutoSet(Chk(s->chAuto));
     int dbg = Chk(s->chDebug);
     if (dbg != g_debug) { g_debug = dbg; if (dbg) { DeleteFileW(g_log); LogStartup(); } }
@@ -2639,6 +2721,14 @@ static void SetCmd(Dlg *d, int id, int code) {
         d->done = 1;
         break;
     case 905: CopyLog(); break;
+    case 907:
+        if (BrowseOpen(d->h, L"Программы\0*.exe;*.com;*.bat;*.cmd\0Все файлы\0*.*\0", f, MAX_PATH)) {
+            wchar_t q[MAX_PATH + 4];
+            if (wcschr(f, L' ')) _snwprintf(q, MAX_PATH + 4, L"\"%ls\"", f); else cp(q, WSZ(q), f);
+            q[MAX_PATH + 3] = 0;
+            SetWindowTextW(s->eEditor, q);
+        }
+        break;
     case IDOK:
         if (SetApply(s)) { d->result = 1; d->done = 1; }
         break;
@@ -2762,7 +2852,7 @@ static HMENU BuildSection(int s) {
     return m;
 }
 static HMENU BuildMainMenu(void) {
-    static const wchar_t *const titles[NSEC] = { L"Программы", L"Скрипты и команды", L"Папки" };
+    static const wchar_t *const titles[NSEC] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы" };
     HMENU m = CreatePopupMenu();
     for (int s = 0; s < NSEC; s++) AppendMenuW(m, MF_POPUP | MF_STRING, (UINT_PTR)BuildSection(s), titles[s]);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -2801,6 +2891,194 @@ static void HandleCmd(int cmd, MonBtn *b) {
     case ID_EXIT: DestroyWindow(g_ctl); break;
     }
 }
+/* ---------- правая кнопка на пункте меню: свои действия ---------- */
+enum { CX_SHELL = 3001, CX_REVEAL, CX_COPYPATH, CX_COPYFILE, CX_PROPS, CX_EDIT };
+static IContextMenu2 *g_cm2;
+static IContextMenu3 *g_cm3;
+static HHOOK g_mhook;
+static int g_ctxSec = -1, g_ctxIdx = -1;
+static POINT g_ctxPt;
+
+static int EntryTarget(const Entry *e, wchar_t *out, int n, int *exists) { /* путь к файлу/папке пункта (0 — это не файл) */
+    wchar_t p[1100], full[1100];
+    if (e->type != 0 || !e->action[0] || e->action[0] == L'@') return 0;
+    ExpandEnvironmentStringsW(e->action, p, 1100);
+    Trim(p);
+    size_t l = wcslen(p);
+    if (l > 1 && p[0] == L'"' && p[l - 1] == L'"') { p[l - 1] = 0; memmove(p, p + 1, l * sizeof(wchar_t)); }
+    if (wcsstr(p, L"://") || !_wcsnicmp(p, L"mailto:", 7)) return 0;
+    cp(full, WSZ(full), p);
+    if (!wcschr(p, L'\\') && !wcschr(p, L':')) { /* просто имя программы: ищем в PATH */
+        if (!SearchPathW(NULL, p, NULL, 1100, full, NULL) && !SearchPathW(NULL, p, L".exe", 1100, full, NULL)) { *exists = 0; cp(out, (size_t)n, p); return 1; }
+    }
+    cp(out, (size_t)n, full);
+    *exists = GetFileAttributesW(full) != INVALID_FILE_ATTRIBUTES;
+    return 1;
+}
+static void RevealPath(const wchar_t *path) { /* открыть папку в проводнике с выделением файла */
+    PIDLIST_ABSOLUTE pidl = NULL;
+    if (SUCCEEDED(SHParseDisplayName(path, NULL, &pidl, 0, NULL)) && pidl) {
+        SHOpenFolderAndSelectItems(pidl, 0, NULL, 0);
+        CoTaskMemFree(pidl);
+    } else {
+        wchar_t a[MAX_PATH * 2 + 16];
+        _snwprintf(a, MAX_PATH * 2 + 16, L"/select,\"%ls\"", path);
+        a[MAX_PATH * 2 + 15] = 0;
+        ShellExecuteW(NULL, L"open", L"explorer.exe", a, NULL, SW_SHOWNORMAL);
+    }
+}
+static int CopyFileToClipboard(const wchar_t *path) { /* как Ctrl+C на файле в проводнике */
+    size_t n = wcslen(path) + 1, bytes = sizeof(DROPFILES) + (n + 1) * sizeof(wchar_t);
+    HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+    HGLOBAL ge = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+    if (!g || !ge) { if (g) GlobalFree(g); if (ge) GlobalFree(ge); return 0; }
+    DROPFILES *df = (DROPFILES *)GlobalLock(g);
+    df->pFiles = sizeof(DROPFILES);
+    df->fWide = TRUE;
+    memcpy((BYTE *)df + sizeof(DROPFILES), path, n * sizeof(wchar_t));
+    GlobalUnlock(g);
+    *(DWORD *)GlobalLock(ge) = DROPEFFECT_COPY;
+    GlobalUnlock(ge);
+    if (!OpenClipboard(g_ctl)) { GlobalFree(g); GlobalFree(ge); return 0; }
+    EmptyClipboard();
+    SetClipboardData(CF_HDROP, g);
+    SetClipboardData(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT), ge);
+    CloseClipboard();
+    return 1;
+}
+static void ShowProps(const wchar_t *path) {
+    SHELLEXECUTEINFOW sei;
+    memset(&sei, 0, sizeof sei);
+    sei.cbSize = sizeof sei;
+    sei.fMask = SEE_MASK_INVOKEIDLIST;
+    sei.hwnd = g_ctl;
+    sei.lpVerb = L"properties";
+    sei.lpFile = path;
+    sei.nShow = SW_SHOW;
+    ShellExecuteExW(&sei);
+}
+static void ShellContextMenu(const wchar_t *path, POINT pt) { /* обычное контекстное меню проводника */
+    PIDLIST_ABSOLUTE pidl = NULL;
+    IShellFolder *sf = NULL;
+    PCUITEMID_CHILD child = NULL;
+    if (FAILED(SHParseDisplayName(path, NULL, &pidl, 0, NULL)) || !pidl) return;
+    if (SUCCEEDED(SHBindToParent(pidl, &IID_IShellFolder, (void **)&sf, &child)) && sf) {
+        IContextMenu *cm = NULL;
+        if (SUCCEEDED(sf->lpVtbl->GetUIObjectOf(sf, g_ctl, 1, &child, &IID_IContextMenu, NULL, (void **)&cm)) && cm) {
+            HMENU hm = CreatePopupMenu();
+            UINT fl = CMF_NORMAL | CMF_CANRENAME | ((GetKeyState(VK_SHIFT) < 0) ? CMF_EXTENDEDVERBS : 0);
+            if (SUCCEEDED(cm->lpVtbl->QueryContextMenu(cm, hm, 0, 1, 0x7FFF, fl))) {
+                cm->lpVtbl->QueryInterface(cm, &IID_IContextMenu3, (void **)&g_cm3);
+                cm->lpVtbl->QueryInterface(cm, &IID_IContextMenu2, (void **)&g_cm2);
+                g_inMenu = 1;
+                SetForegroundWindow(g_ctl);
+                int cmd = (int)TrackPopupMenu(hm, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_ctl, NULL);
+                PostMessageW(g_ctl, WM_NULL, 0, 0);
+                g_inMenu = 0;
+                if (g_cm3) { g_cm3->lpVtbl->Release(g_cm3); g_cm3 = NULL; }
+                if (g_cm2) { g_cm2->lpVtbl->Release(g_cm2); g_cm2 = NULL; }
+                if (cmd > 0) {
+                    CMINVOKECOMMANDINFOEX ci;
+                    memset(&ci, 0, sizeof ci);
+                    ci.cbSize = sizeof ci;
+                    ci.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
+                    ci.hwnd = g_ctl;
+                    ci.lpVerb = MAKEINTRESOURCEA(cmd - 1);
+                    ci.lpVerbW = MAKEINTRESOURCEW(cmd - 1);
+                    ci.nShow = SW_SHOWNORMAL;
+                    ci.ptInvoke = pt;
+                    cm->lpVtbl->InvokeCommand(cm, (CMINVOKECOMMANDINFO *)&ci);
+                }
+            }
+            DestroyMenu(hm);
+            cm->lpVtbl->Release(cm);
+        }
+        sf->lpVtbl->Release(sf);
+    }
+    CoTaskMemFree(pidl);
+}
+static void ShowEntryContext(void) {
+    int sec = g_ctxSec, idx = g_ctxIdx, exists = 0;
+    POINT pt = g_ctxPt;
+    wchar_t path[1100];
+    g_ctxSec = -1;
+    if (sec < 0 || sec >= NSEC || idx < 0 || idx >= g_cnt[sec]) return;
+    Entry *e = &g_ent[sec][idx];
+    if (!EntryTarget(e, path, 1100, &exists)) return;
+    int isDir = exists && IsDirPath(path);
+    int script = exists && !isDir && (sec == SEC_SCRIPT || IsScriptExt(path));
+    UINT gr = exists ? 0 : MF_GRAYED;
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | gr, CX_SHELL, L"Контекстное меню Explorer");
+    AppendMenuW(m, MF_STRING | gr, CX_REVEAL, L"Показать в папке");
+    AppendMenuW(m, MF_STRING, CX_COPYPATH, L"Скопировать путь");
+    AppendMenuW(m, MF_STRING | gr, CX_COPYFILE, L"Скопировать");
+    AppendMenuW(m, MF_STRING | gr, CX_PROPS, L"Свойства");
+    if (script) {
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(m, MF_STRING, CX_EDIT, g_cfg.editor[0] ? L"Открыть в текстовом редакторе" : L"Открыть в блокноте");
+    }
+    g_inMenu = 1;
+    SetForegroundWindow(g_ctl);
+    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_ctl, NULL);
+    PostMessageW(g_ctl, WM_NULL, 0, 0);
+    g_inMenu = 0;
+    DestroyMenu(m);
+    switch (cmd) {
+    case CX_SHELL: ShellContextMenu(path, pt); break;
+    case CX_REVEAL: RevealPath(path); break;
+    case CX_COPYPATH: {
+        static wchar_t buf[3000], args[1300];
+        if (sec == SEC_PROG || sec == SEC_SCRIPT) { /* путь с аргументами запуска */
+            ExpandEnvironmentStringsW(e->args, args, 1300);
+            Trim(args);
+            if (args[0]) _snwprintf(buf, 3000, L"\"%ls\" %ls", path, args); else _snwprintf(buf, 3000, L"\"%ls\"", path);
+        } else cp(buf, WSZ(buf), path);
+        buf[2999] = 0;
+        if (CopyText(buf)) Balloon(L"Путь скопирован", buf);
+        break;
+    }
+    case CX_COPYFILE:
+        if (CopyFileToClipboard(path)) Balloon(L"Скопировано в буфер обмена (можно вставить в проводнике)", path);
+        break;
+    case CX_PROPS: ShowProps(path); break;
+    case CX_EDIT: OpenInEditor(path); break;
+    }
+}
+/* перехват правой кнопки в нашем всплывающем меню (пока оно открыто) */
+static LRESULT CALLBACK MenuHookProc(int code, WPARAM w, LPARAM l) {
+    if (code == MSGF_MENU) {
+        MSG *m = (MSG *)l;
+        if (m->message == WM_RBUTTONUP && g_selMenu) {
+            int pos = MenuItemFromPoint(NULL, g_selMenu, m->pt);
+            if (pos >= 0) {
+                UINT id = GetMenuItemID(g_selMenu, pos);
+                if (id >= ID_ENT0 && id < ID_ENT0 + NSEC * MAXE) {
+                    int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
+                    wchar_t tp[1100];
+                    int ex = 0;
+                    if (idx < g_cnt[sec] && EntryTarget(&g_ent[sec][idx], tp, 1100, &ex)) {
+                        g_ctxSec = sec;
+                        g_ctxIdx = idx;
+                        g_ctxPt = m->pt;
+                        EndMenu();
+                    }
+                }
+                return 1; /* правый клик не должен запускать пункт */
+            }
+        }
+    }
+    return CallNextHookEx(g_mhook, code, w, l);
+}
+static int TrackWithHook(HWND owner, HMENU m, POINT pt) {
+    g_ctxSec = -1;
+    g_selMenu = NULL;
+    g_mhook = SetWindowsHookExW(WH_MSGFILTER, MenuHookProc, NULL, GetCurrentThreadId());
+    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, owner, NULL);
+    if (g_mhook) { UnhookWindowsHookEx(g_mhook); g_mhook = NULL; }
+    PostMessageW(owner, WM_NULL, 0, 0);
+    return cmd;
+}
 static void ShowMenu(MonBtn *b) {
     HWND f = GetForegroundWindow();
     if (f && !IsOurs(f) && !BadClass(f)) g_prevFg = f;
@@ -2810,12 +3088,12 @@ static void ShowMenu(MonBtn *b) {
     GetCursorPos(&pt);
     g_inMenu = 1;
     SetForegroundWindow(b->hwnd);
-    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, b->hwnd, NULL);
-    PostMessageW(b->hwnd, WM_NULL, 0, 0);
+    int cmd = TrackWithHook(b->hwnd, m, pt);
     g_inMenu = 0;
     TipHide();
     DestroyMenu(m);
     if (cmd) HandleCmd(cmd, b);
+    else if (g_ctxSec >= 0) ShowEntryContext();
 }
 
 /* ---------- оконные процедуры ---------- */
@@ -2905,12 +3183,12 @@ static void ShowTrayMenu(void) {
     GetCursorPos(&pt);
     g_inMenu = 1;
     SetForegroundWindow(g_ctl);
-    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_ctl, NULL);
-    PostMessageW(g_ctl, WM_NULL, 0, 0);
+    int cmd = TrackWithHook(g_ctl, m, pt);
     g_inMenu = 0;
     TipHide();
     DestroyMenu(m);
     if (cmd) HandleCmd(cmd, g_nmb ? g_mb[0] : NULL);
+    else if (g_ctxSec >= 0) ShowEntryContext();
 }
 static void CALLBACK FgHook(HWINEVENTHOOK hk, DWORD ev, HWND w, LONG idObj, LONG idChild, DWORD th, DWORD ms) {
     (void)hk; (void)ev; (void)idChild; (void)th; (void)ms;
@@ -2920,6 +3198,11 @@ static void CALLBACK FgHook(HWINEVENTHOOK hk, DWORD ev, HWND w, LONG idObj, LONG
 }
 static LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (g_wmTaskbar && m == g_wmTaskbar) { TrayAdd(); return 0; } /* проводник перезапущен */
+    if ((g_cm2 || g_cm3) && (m == WM_INITMENUPOPUP || m == WM_DRAWITEM || m == WM_MEASUREITEM || m == WM_MENUCHAR)) {
+        LRESULT r = 0;
+        if (g_cm3) { if (SUCCEEDED(g_cm3->lpVtbl->HandleMenuMsg2(g_cm3, m, w, l, &r))) return r; }
+        else if (SUCCEEDED(g_cm2->lpVtbl->HandleMenuMsg(g_cm2, m, w, l))) return (m == WM_INITMENUPOPUP) ? 0 : TRUE;
+    }
     switch (m) {
     case WM_TRAY:
         if (g_modal) return 0;
