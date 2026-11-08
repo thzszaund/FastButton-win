@@ -3045,6 +3045,27 @@ static void ShowEntryContext(void) {
     case CX_EDIT: OpenInEditor(path); break;
     }
 }
+/* правый клик по пункту нашего меню: запоминаем пункт и закрываем меню (контекстное меню покажем после этого) */
+static int CtxFromItem(HMENU hm, int pos, POINT pt) { /* 1 = клик обработан (пункт — файл/папка) */
+    if (!hm || pos < 0) return 0;
+    UINT id = GetMenuItemID(hm, pos);
+    if (id < ID_ENT0 || id >= ID_ENT0 + NSEC * MAXE) return 0;
+    int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
+    wchar_t tp[1100];
+    int ex = 0;
+    if (idx >= g_cnt[sec] || !EntryTarget(&g_ent[sec][idx], tp, 1100, &ex)) return 0;
+    g_ctxSec = sec;
+    g_ctxIdx = idx;
+    g_ctxPt = pt;
+    EndMenu();
+    return 1;
+}
+static void OnMenuRButtonUp(int pos, HMENU hm) { /* WM_MENURBUTTONUP: запасной путь, если перехватчик не сработал */
+    POINT pt;
+    if (g_ctxSec >= 0) return;
+    GetCursorPos(&pt);
+    CtxFromItem(hm, pos, pt);
+}
 /* перехват правой кнопки в нашем всплывающем меню (пока оно открыто) */
 static LRESULT CALLBACK MenuHookProc(int code, WPARAM w, LPARAM l) {
     if (code == MSGF_MENU) {
@@ -3052,18 +3073,7 @@ static LRESULT CALLBACK MenuHookProc(int code, WPARAM w, LPARAM l) {
         if (m->message == WM_RBUTTONUP && g_selMenu) {
             int pos = MenuItemFromPoint(NULL, g_selMenu, m->pt);
             if (pos >= 0) {
-                UINT id = GetMenuItemID(g_selMenu, pos);
-                if (id >= ID_ENT0 && id < ID_ENT0 + NSEC * MAXE) {
-                    int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
-                    wchar_t tp[1100];
-                    int ex = 0;
-                    if (idx < g_cnt[sec] && EntryTarget(&g_ent[sec][idx], tp, 1100, &ex)) {
-                        g_ctxSec = sec;
-                        g_ctxIdx = idx;
-                        g_ctxPt = m->pt;
-                        EndMenu();
-                    }
-                }
+                CtxFromItem(g_selMenu, pos, m->pt);
                 return 1; /* правый клик не должен запускать пункт */
             }
         }
@@ -3074,7 +3084,7 @@ static int TrackWithHook(HWND owner, HMENU m, POINT pt) {
     g_ctxSec = -1;
     g_selMenu = NULL;
     g_mhook = SetWindowsHookExW(WH_MSGFILTER, MenuHookProc, NULL, GetCurrentThreadId());
-    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, owner, NULL);
+    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD, pt.x, pt.y, 0, owner, NULL); /* без TPM_RIGHTBUTTON: правый клик пункт не запускает */
     if (g_mhook) { UnhookWindowsHookEx(g_mhook); g_mhook = NULL; }
     PostMessageW(owner, WM_NULL, 0, 0);
     return cmd;
@@ -3163,6 +3173,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_MENUSELECT:
         OnMenuSelect(w, l);
         return 0;
+    case WM_MENURBUTTONUP:
+        OnMenuRButtonUp((int)w, (HMENU)l);
+        return 0;
     case WM_MBUTTONUP:
         RunAct(&g_mid, b);
         return 0;
@@ -3210,6 +3223,7 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         else if (l == WM_RBUTTONUP || l == WM_CONTEXTMENU) ShowTrayMenu();
         return 0;
     case WM_MENUSELECT: OnMenuSelect(w, l); return 0;
+    case WM_MENURBUTTONUP: OnMenuRButtonUp((int)w, (HMENU)l); return 0;
     case WM_APP + 5: ShowSettings(); return 0;
     case WM_DISPLAYCHANGE: SetTimer(h, 9, 700, NULL); return 0;
     case WM_TIMER:
