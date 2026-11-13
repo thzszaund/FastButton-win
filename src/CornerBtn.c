@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.6.0"
+#define APPVER L"2.7.0"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -38,7 +38,7 @@ enum { SEC_PROG = 0, SEC_SCRIPT = 1, SEC_FOLDER = 2, SEC_FILES = 3 };
 #define WSZ(a) (sizeof(a) / sizeof((a)[0]))
 
 /* ---------- данные ---------- */
-typedef struct { wchar_t action[520]; wchar_t args[260]; } Act;
+typedef struct { wchar_t action[520]; wchar_t args[260]; wchar_t interp[260]; int flags; } Act; /* action "@script:путь" = скрипт (interp, flags как у пункта) */
 typedef struct { int depth, type, flags; wchar_t name[128], action[520], args[260], icon[260], note[300], interp[260]; } Entry; /* type: 0 пункт, 1 категория, 2 разделитель; flags: 1 админ, 2 скрытое окно */
 
 typedef struct MonBtn {
@@ -74,7 +74,7 @@ static HTREEITEM g_htis[NSEC][MAXE];
 #define g_tree g_trees[g_cur]
 #define g_hti g_htis[g_cur]
 static Act g_click, g_dbl, g_mid;
-static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; } g_cfg;
+static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; int midAct[NSEC]; } g_cfg;
 static wchar_t g_excl[MAXLIST][64], g_remote[MAXLIST][64];
 static int g_nexcl, g_nremote;
 static HICON g_icon;
@@ -364,6 +364,9 @@ static void SaveActs(void) {
     PutS(L"DoubleClick", L"Args", g_dbl.args);
     PutS(L"MiddleClick", L"Action", g_mid.action);
     PutS(L"MiddleClick", L"Args", g_mid.args);
+    PutS(L"Click", L"Interp", g_click.interp);   PutI(L"Click", L"Flags", g_click.flags);
+    PutS(L"DoubleClick", L"Interp", g_dbl.interp); PutI(L"DoubleClick", L"Flags", g_dbl.flags);
+    PutS(L"MiddleClick", L"Interp", g_mid.interp); PutI(L"MiddleClick", L"Flags", g_mid.flags);
 }
 
 static void LoadAll(void) {
@@ -391,6 +394,13 @@ static void LoadAll(void) {
     GetS(L"DoubleClick", L"Args", L"", g_dbl.args, 260);
     GetS(L"MiddleClick", L"Action", L"@none", g_mid.action, 520);
     GetS(L"MiddleClick", L"Args", L"", g_mid.args, 260);
+    GetS(L"Click", L"Interp", L"", g_click.interp, 260);   g_click.flags = GetI(L"Click", L"Flags", 0);
+    GetS(L"DoubleClick", L"Interp", L"", g_dbl.interp, 260); g_dbl.flags = GetI(L"DoubleClick", L"Flags", 0);
+    GetS(L"MiddleClick", L"Interp", L"", g_mid.interp, 260); g_mid.flags = GetI(L"MiddleClick", L"Flags", 0);
+    g_cfg.midAct[SEC_PROG] = Clamp(GetI(L"Options", L"MidProg", 1), 0, 7);
+    g_cfg.midAct[SEC_SCRIPT] = Clamp(GetI(L"Options", L"MidScript", 3), 0, 7);
+    g_cfg.midAct[SEC_FOLDER] = Clamp(GetI(L"Options", L"MidFolder", 2), 0, 7);
+    g_cfg.midAct[SEC_FILES] = Clamp(GetI(L"Options", L"MidFiles", 2), 0, 7);
 
     if (GetI(L"Button", L"Version", 1) < 2) { /* миграция с v1: "@desktop" теперь значит "все мониторы" */
         if (!wcscmp(g_click.action, L"@desktop")) cp(g_click.action, WSZ(g_click.action), L"@mondesk");
@@ -427,6 +437,10 @@ static void SaveCfg(void) {
     PutI(L"Options", L"Debug", g_debug);
     PutI(L"Options", L"ShowButtons", g_cfg.show);
     PutS(L"Options", L"TextEditor", g_cfg.editor);
+    PutI(L"Options", L"MidProg", g_cfg.midAct[SEC_PROG]);
+    PutI(L"Options", L"MidScript", g_cfg.midAct[SEC_SCRIPT]);
+    PutI(L"Options", L"MidFolder", g_cfg.midAct[SEC_FOLDER]);
+    PutI(L"Options", L"MidFiles", g_cfg.midAct[SEC_FILES]);
 }
 /* ---------- настройки мониторов ---------- */
 static void MonKey(const wchar_t *dev, wchar_t *out) {
@@ -880,7 +894,7 @@ static void PinToggle(HWND w) {
 }
 
 /* ---------- действия ---------- */
-static void RunSpec(const wchar_t *a, const wchar_t *args, MonBtn *b) {
+static void RunSpecV(const wchar_t *a, const wchar_t *args, MonBtn *b, const wchar_t *verb) {
     if (!a || !*a) return;
     if (a[0] == L'@') {
         if (!wcscmp(a, L"@mondesk")) MonDeskToggle(b ? b : (g_nmb ? g_mb[0] : NULL));
@@ -896,7 +910,7 @@ static void RunSpec(const wchar_t *a, const wchar_t *args, MonBtn *b) {
     ExpandEnvironmentStringsW(a, ex, 1100);
     ea[0] = 0;
     if (args && *args) ExpandEnvironmentStringsW(args, ea, 1100);
-    HINSTANCE r = ShellExecuteW(NULL, L"open", ex, ea[0] ? ea : NULL, g_dir, SW_SHOWNORMAL);
+    HINSTANCE r = ShellExecuteW(NULL, verb, ex, ea[0] ? ea : NULL, g_dir, SW_SHOWNORMAL);
     if ((INT_PTR)r <= 32) {
         wchar_t msg[1300];
         _snwprintf(msg, 1300, L"Не удалось запустить:\n%ls", ex);
@@ -904,7 +918,21 @@ static void RunSpec(const wchar_t *a, const wchar_t *args, MonBtn *b) {
         MessageBoxW(NULL, msg, APPNAME, MB_ICONWARNING);
     }
 }
-static void RunAct(const Act *a, MonBtn *b) { RunSpec(a->action, a->args, b); }
+static void RunSpec(const wchar_t *a, const wchar_t *args, MonBtn *b) { RunSpecV(a, args, b, L"open"); }
+static void RunScript(const Entry *e);
+static void RunAct(const Act *a, MonBtn *b) {
+    if (!wcsncmp(a->action, L"@script:", 8)) { /* действие мыши = скрипт (bat, cmd, vbs, js, ps1, py …) */
+        static Entry se;
+        memset(&se, 0, sizeof se);
+        cp(se.action, WSZ(se.action), a->action + 8);
+        cp(se.args, WSZ(se.args), a->args);
+        cp(se.interp, WSZ(se.interp), a->interp);
+        se.flags = a->flags;
+        RunScript(&se);
+        return;
+    }
+    RunSpec(a->action, a->args, b);
+}
 
 /* ---------- кнопки на мониторах ---------- */
 static void LoadIconCfg(void) {
@@ -1405,22 +1433,40 @@ static void TipShow(const wchar_t *text, int x, int y) {
     SendMessageW(g_tip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&g_ti);
 }
 static HMENU g_selMenu; /* меню, в котором сейчас выделен пункт */
+typedef struct { HMENU m; int sec, idx; } SubMap;
+static SubMap g_subMap[400]; /* подменю-категории -> запись */
+static int g_nsub;
+static int EntryTarget(const Entry *e, wchar_t *out, int n, int *exists);
 static void OnMenuSelect(WPARAM w, LPARAM l) {
     UINT id = LOWORD(w), fl = HIWORD(w);
     HMENU hm = (HMENU)l;
+    wchar_t tmp[1100];
+    const wchar_t *text = NULL;
+    int pos = -1;
     if (hm) g_selMenu = hm;
-    if (!hm || fl == 0xFFFF || (fl & (MF_POPUP | MF_SEPARATOR)) || !id) { TipHide(); return; }
-    if (id >= ID_ENT0 && id < ID_ENT0 + NSEC * MAXE) {
-        int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
-        if (idx < g_cnt[sec] && g_ent[sec][idx].note[0]) {
-            int n = GetMenuItemCount(hm);
-            for (int p = 0; p < n; p++) {
-                if (GetMenuItemID(hm, p) == id) {
-                    RECT rc;
-                    if (GetMenuItemRect(NULL, hm, (UINT)p, &rc)) { TipShow(g_ent[sec][idx].note, rc.right + 2, rc.top); return; }
-                }
+    if (!hm || fl == 0xFFFF || (fl & MF_SEPARATOR)) { TipHide(); return; }
+    if (fl & MF_POPUP) { /* категория: аннотация, если есть */
+        HMENU sm = GetSubMenu(hm, (int)id);
+        for (int i = 0; i < g_nsub; i++)
+            if (g_subMap[i].m == sm && g_subMap[i].idx < g_cnt[g_subMap[i].sec]) {
+                const Entry *e = &g_ent[g_subMap[i].sec][g_subMap[i].idx];
+                if (e->note[0]) text = e->note;
             }
+        pos = (int)id;
+    } else if (id >= ID_ENT0 && id < ID_ENT0 + NSEC * MAXE) {
+        int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
+        if (idx < g_cnt[sec]) {
+            const Entry *e = &g_ent[sec][idx];
+            int ex = 0;
+            if (e->note[0]) text = e->note;
+            else if (EntryTarget(e, tmp, 1100, &ex)) text = tmp; /* аннотации нет: показываем полный путь */
+            int n = GetMenuItemCount(hm);
+            for (int p = 0; p < n; p++) if (GetMenuItemID(hm, p) == id) { pos = p; break; }
         }
+    }
+    if (text && pos >= 0) {
+        RECT rc;
+        if (GetMenuItemRect(NULL, hm, (UINT)pos, &rc)) { TipShow(text, rc.right + 2, rc.top); return; }
     }
     TipHide();
 }
@@ -1586,7 +1632,7 @@ static int EditActDlg(int mode, const wchar_t *title, wchar_t *name, wchar_t *ac
         int sel = NBI;
         for (int i = 0; i < NBI; i++) if (!wcscmp(action, BI[i].id)) sel = i;
         SendMessageW(a.cb, CB_SETCURSEL, sel, 0);
-        if (sel == NBI) { SetWindowTextW(a.ePath, action); SetWindowTextW(a.eArgs, args); }
+        if (sel == NBI) { SetWindowTextW(a.ePath, !wcsncmp(action, L"@script:", 8) ? action + 8 : action); SetWindowTextW(a.eArgs, args); }
         ActEnable(&a);
     }
     Btn(h, L"OK", 288, y, 85, 28, IDOK, 1);
@@ -2063,9 +2109,9 @@ static void EntCmd(Dlg *d, int id, int code) {
         if (!e->name[0]) { MessageBoxW(d->h, L"Введите название.", APPNAME, MB_ICONINFORMATION); return; }
         GetWindowTextW(a->eIcon, e->icon, 260);
         Trim(e->icon);
+        GetWindowTextW(a->eNote, e->note, 300);
+        Trim(e->note);
         if (a->type == 0) {
-            GetWindowTextW(a->eNote, e->note, 300);
-            Trim(e->note);
             if (a->sec == SEC_PROG) {
                 int s = (int)SendMessageW(a->cb, CB_GETCURSEL, 0, 0);
                 if (s >= 0 && s < NBI) { cp(e->action, WSZ(e->action), BI[s].id); e->args[0] = 0; }
@@ -2104,7 +2150,7 @@ static int EditEntryDlg(int sec, int type, Entry *e, const wchar_t *title, HWND 
     a.sec = sec;
     a.type = type;
     a.e = *e;
-    int rows = (type == 1) ? 2 : (sec == SEC_FOLDER ? 4 : (sec == SEC_FILES ? 5 : 6));
+    int rows = (type == 1) ? 3 : (sec == SEC_FOLDER ? 4 : (sec == SEC_FILES ? 5 : 6));
     int ch = 12 + rows * 56 + ((sec == SEC_SCRIPT && type == 0) ? 54 : 0) + 44;
     NewDlg(&a.d, title, 520, ch);
     a.d.oncmd = EntCmd;
@@ -2148,8 +2194,8 @@ static int EditEntryDlg(int sec, int type, Entry *e, const wchar_t *title, HWND 
     a.eIcon = Edt(h, 12, y + 20, 340, 24, ED_ICON);
     Btn(h, L"Обзор…", 360, y + 20, 148, 24, ED_BICON, 0);
     y += 56;
-    if (type == 0) {
-        Lbl(h, L"Аннотация (подсказка при наведении в меню; необязательно):", 12, y, 496, 18);
+    {
+        Lbl(h, L"Аннотация (подсказка при наведении в меню; пусто — для файлов и папок показывается путь):", 12, y, 496, 18);
         a.eNote = Edt(h, 12, y + 20, 496, 24, ED_NOTE);
         SetWindowTextW(a.eNote, e->note);
         y += 56;
@@ -2426,7 +2472,7 @@ typedef struct {
     int mdx[MAXMON], mdy[MAXMON];
     HWND chPinTop, chPinAll, chRaise, chKeep, chLocal;
     HWND eExcl, eRemote;
-    HWND chAuto, chDebug, eEditor;
+    HWND chAuto, chDebug, eEditor, cbMid[NSEC];
 } SetDlg;
 static Entry g_bak[NSEC][MAXE];
 static int g_bakn[NSEC];
@@ -2434,6 +2480,12 @@ static int g_bakn[NSEC];
 static void ActDesc(const Act *a, wchar_t *out, int n) {
     for (int i = 0; i < NBI; i++) if (!wcscmp(a->action, BI[i].id)) { cp(out, (size_t)n, BI[i].label); return; }
     if (!a->action[0]) { cp(out, (size_t)n, L"(нет действия)"); return; }
+    if (!wcsncmp(a->action, L"@script:", 8)) {
+        if (a->args[0]) _snwprintf(out, (size_t)n, L"Скрипт: %ls  %ls", a->action + 8, a->args);
+        else _snwprintf(out, (size_t)n, L"Скрипт: %ls", a->action + 8);
+        out[n - 1] = 0;
+        return;
+    }
     if (a->args[0]) _snwprintf(out, (size_t)n, L"Открыть: %ls  %ls", a->action, a->args);
     else _snwprintf(out, (size_t)n, L"Открыть: %ls", a->action);
     out[n - 1] = 0;
@@ -2558,14 +2610,26 @@ static void ActText(SetDlg *s, int k) {
     ActDesc(&s->a[k], b, 1200);
     SetWindowTextW(s->stAct[k], b);
 }
+static const wchar_t *const g_midName[8] = { L"Нет действия", L"Запустить от имени администратора", L"Показать в папке", L"Открыть в текстовом редакторе",
+                                              L"Скопировать путь", L"Контекстное меню Explorer", L"Свойства", L"Скопировать файл" };
+static const wchar_t *const g_secTitle[NSEC] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы" };
 static void PgAct(SetDlg *s, HWND pg, int PW) {
     s->a[0] = g_click; s->a[1] = g_dbl; s->a[2] = g_mid;
     for (int k = 0; k < 3; k++) {
-        int y = 16 + k * 76;
+        int y = 12 + k * 66;
         Lbl(pg, g_actTitle[k], 12, y, 400, 18);
-        s->stAct[k] = Mk(pg, L"STATIC", L"", SS_LEFT, 0, 28, y + 22, PW - 190, 36, -1);
-        Btn(pg, L"Изменить…", PW - 150, y + 20, 130, 28, 301 + k, 0);
+        s->stAct[k] = Mk(pg, L"STATIC", L"", SS_LEFT, 0, 28, y + 20, PW - 330, 36, -1);
+        Btn(pg, L"Действие…", PW - 290, y + 18, 130, 28, 301 + k, 0);
+        Btn(pg, L"Скрипт…", PW - 152, y + 18, 130, 28, 331 + k, 0);
         ActText(s, k);
+    }
+    Lbl(pg, L"Средняя кнопка мыши по пункту в выпадающем меню (программы, скрипты, папки, файлы):", 12, 222, PW - 24, 18);
+    for (int sec = 0; sec < NSEC; sec++) {
+        int y = 248 + sec * 32;
+        Lbl(pg, g_secTitle[sec], 28, y + 3, 200, 20);
+        s->cbMid[sec] = Mk(pg, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, 240, y, 380, 240, 380 + sec);
+        for (int i = 0; i < 8; i++) SendMessageW(s->cbMid[sec], CB_ADDSTRING, 0, (LPARAM)g_midName[i]);
+        SendMessageW(s->cbMid[sec], CB_SETCURSEL, g_cfg.midAct[sec], 0);
     }
 }
 static void PgMon(SetDlg *s, HWND pg) {
@@ -2638,6 +2702,7 @@ static int SetApply(SetDlg *s) {
     Trim(g_cfg.icon);
     g_cfg.shape = (int)SendMessageW(s->cbShape, CB_GETCURSEL, 0, 0) == 1 ? 1 : 0;
     g_click = s->a[0]; g_dbl = s->a[1]; g_mid = s->a[2];
+    for (int k = 0; k < NSEC; k++) { int v = (int)SendMessageW(s->cbMid[k], CB_GETCURSEL, 0, 0); g_cfg.midAct[k] = v < 0 ? 0 : (v > 7 ? 7 : v); }
     g_cfg.show = Chk(s->chShow);
     for (int i = 0; i < s->nm && i < g_nmb; i++) {
         MonBtn *q = g_mb[i];
@@ -2704,7 +2769,31 @@ static void SetCmd(Dlg *d, int id, int code) {
     case 301: case 302: case 303: {
         int k = id - 301;
         wchar_t nm[1] = L"";
-        if (EditActDlg(AM_ACTION, g_actTitle[k], nm, s->a[k].action, s->a[k].args, d->h)) ActText(s, k);
+        if (EditActDlg(AM_ACTION, g_actTitle[k], nm, s->a[k].action, s->a[k].args, d->h)) {
+            if (wcsncmp(s->a[k].action, L"@script:", 8)) { s->a[k].interp[0] = 0; s->a[k].flags = 0; }
+            ActText(s, k);
+        }
+        break;
+    }
+    case 331: case 332: case 333: { /* действие мыши = скрипт */
+        int k = id - 331;
+        static Entry te;
+        memset(&te, 0, sizeof te);
+        if (!wcsncmp(s->a[k].action, L"@script:", 8)) {
+            cp(te.action, WSZ(te.action), s->a[k].action + 8);
+            cp(te.args, WSZ(te.args), s->a[k].args);
+            cp(te.interp, WSZ(te.interp), s->a[k].interp);
+            te.flags = s->a[k].flags;
+            BaseName(te.action, te.name, 128, 0);
+        }
+        if (EditEntryDlg(SEC_SCRIPT, 0, &te, L"Скрипт для действия мыши", d->h)) {
+            _snwprintf(s->a[k].action, 520, L"@script:%ls", te.action);
+            s->a[k].action[519] = 0;
+            cp(s->a[k].args, 260, te.args);
+            cp(s->a[k].interp, 260, te.interp);
+            s->a[k].flags = te.flags;
+            ActText(s, k);
+        }
         break;
     }
     case 502: AddExeToEdit(d->h, s->eExcl); break;
@@ -2827,11 +2916,13 @@ static int BuildSub(HMENU m, int *i, int depth) {
         if (e->type == 2) { AppendMenuW(m, MF_SEPARATOR, 0, NULL); (*i)++; count++; }
         else if (e->type == 1) {
             HMENU sub = CreatePopupMenu();
+            int fi = *i;
             (*i)++;
             int c = BuildSub(sub, i, depth + 1);
             if (!c) AppendMenuW(sub, MF_GRAYED | MF_STRING, 0, L"(пусто)");
             AppendMenuW(m, MF_POPUP | MF_STRING, (UINT_PTR)sub, e->name);
             SetItemBmp(m, GetMenuItemCount(m) - 1, EntryBmp(e, sec));
+            if (g_nsub < 400) { g_subMap[g_nsub].m = sub; g_subMap[g_nsub].sec = sec; g_subMap[g_nsub].idx = fi; g_nsub++; }
             count++;
         } else {
             AppendMenuW(m, MF_STRING, (UINT_PTR)(ID_ENT0 + sec * MAXE + *i), e->name);
@@ -2854,6 +2945,7 @@ static HMENU BuildSection(int s) {
 static HMENU BuildMainMenu(void) {
     static const wchar_t *const titles[NSEC] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы" };
     HMENU m = CreatePopupMenu();
+    g_nsub = 0;
     for (int s = 0; s < NSEC; s++) AppendMenuW(m, MF_POPUP | MF_STRING, (UINT_PTR)BuildSection(s), titles[s]);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (g_cfg.show ? MF_CHECKED : 0), ID_TOGGLE, ShowLabel());
@@ -2891,13 +2983,14 @@ static void HandleCmd(int cmd, MonBtn *b) {
     case ID_EXIT: DestroyWindow(g_ctl); break;
     }
 }
-/* ---------- правая кнопка на пункте меню: свои действия ---------- */
+/* ---------- правая/средняя кнопка на пункте меню ---------- */
+#define WM_ITEMCLICK (WM_APP + 7) /* wParam: (вид<<24)|(раздел<<16)|индекс; lParam: экранные x,y; вид 0 = правая, 1 = средняя */
 enum { CX_SHELL = 3001, CX_REVEAL, CX_COPYPATH, CX_COPYFILE, CX_PROPS, CX_EDIT };
 static IContextMenu2 *g_cm2;
 static IContextMenu3 *g_cm3;
 static HHOOK g_mhook;
-static int g_ctxSec = -1, g_ctxIdx = -1;
-static POINT g_ctxPt;
+static HWND g_menuOwner; /* владелец открытого меню; пока оно открыто, дополнительные меню показываем поверх (TPM_RECURSE) */
+static int g_itemBusy;
 
 static int EntryTarget(const Entry *e, wchar_t *out, int n, int *exists) { /* путь к файлу/папке пункта (0 — это не файл) */
     wchar_t p[1100], full[1100];
@@ -2961,20 +3054,20 @@ static void ShellContextMenu(const wchar_t *path, POINT pt) { /* обычное 
     PIDLIST_ABSOLUTE pidl = NULL;
     IShellFolder *sf = NULL;
     PCUITEMID_CHILD child = NULL;
+    HWND owner = g_menuOwner ? g_menuOwner : g_ctl;
     if (FAILED(SHParseDisplayName(path, NULL, &pidl, 0, NULL)) || !pidl) return;
     if (SUCCEEDED(SHBindToParent(pidl, &IID_IShellFolder, (void **)&sf, &child)) && sf) {
         IContextMenu *cm = NULL;
-        if (SUCCEEDED(sf->lpVtbl->GetUIObjectOf(sf, g_ctl, 1, &child, &IID_IContextMenu, NULL, (void **)&cm)) && cm) {
+        if (SUCCEEDED(sf->lpVtbl->GetUIObjectOf(sf, owner, 1, &child, &IID_IContextMenu, NULL, (void **)&cm)) && cm) {
             HMENU hm = CreatePopupMenu();
             UINT fl = CMF_NORMAL | CMF_CANRENAME | ((GetKeyState(VK_SHIFT) < 0) ? CMF_EXTENDEDVERBS : 0);
             if (SUCCEEDED(cm->lpVtbl->QueryContextMenu(cm, hm, 0, 1, 0x7FFF, fl))) {
                 cm->lpVtbl->QueryInterface(cm, &IID_IContextMenu3, (void **)&g_cm3);
                 cm->lpVtbl->QueryInterface(cm, &IID_IContextMenu2, (void **)&g_cm2);
-                g_inMenu = 1;
-                SetForegroundWindow(g_ctl);
-                int cmd = (int)TrackPopupMenu(hm, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_ctl, NULL);
-                PostMessageW(g_ctl, WM_NULL, 0, 0);
-                g_inMenu = 0;
+                if (!g_menuOwner) { g_inMenu = 1; SetForegroundWindow(g_ctl); }
+                int cmd = (int)TrackPopupMenu(hm, TPM_RETURNCMD | TPM_RIGHTBUTTON | (g_menuOwner ? TPM_RECURSE : 0), pt.x, pt.y, 0, owner, NULL);
+                PostMessageW(owner, WM_NULL, 0, 0);
+                if (!g_menuOwner) g_inMenu = 0;
                 if (g_cm3) { g_cm3->lpVtbl->Release(g_cm3); g_cm3 = NULL; }
                 if (g_cm2) { g_cm2->lpVtbl->Release(g_cm2); g_cm2 = NULL; }
                 if (cmd > 0) {
@@ -2997,34 +3090,19 @@ static void ShellContextMenu(const wchar_t *path, POINT pt) { /* обычное 
     }
     CoTaskMemFree(pidl);
 }
-static void ShowEntryContext(void) {
-    int sec = g_ctxSec, idx = g_ctxIdx, exists = 0;
-    POINT pt = g_ctxPt;
-    wchar_t path[1100];
-    g_ctxSec = -1;
-    if (sec < 0 || sec >= NSEC || idx < 0 || idx >= g_cnt[sec]) return;
-    Entry *e = &g_ent[sec][idx];
-    if (!EntryTarget(e, path, 1100, &exists)) return;
-    int isDir = exists && IsDirPath(path);
-    int script = exists && !isDir && (sec == SEC_SCRIPT || IsScriptExt(path));
-    UINT gr = exists ? 0 : MF_GRAYED;
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING | gr, CX_SHELL, L"Контекстное меню Explorer");
-    AppendMenuW(m, MF_STRING | gr, CX_REVEAL, L"Показать в папке");
-    AppendMenuW(m, MF_STRING, CX_COPYPATH, L"Скопировать путь");
-    AppendMenuW(m, MF_STRING | gr, CX_COPYFILE, L"Скопировать");
-    AppendMenuW(m, MF_STRING | gr, CX_PROPS, L"Свойства");
-    if (script) {
-        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(m, MF_STRING, CX_EDIT, g_cfg.editor[0] ? L"Открыть в текстовом редакторе" : L"Открыть в блокноте");
-    }
-    g_inMenu = 1;
-    SetForegroundWindow(g_ctl);
-    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_ctl, NULL);
-    PostMessageW(g_ctl, WM_NULL, 0, 0);
-    g_inMenu = 0;
-    DestroyMenu(m);
-    switch (cmd) {
+static int CmForward(UINT m, WPARAM w, LPARAM l, LRESULT *r) { /* сообщения владельческого меню проводника */
+    if (!(g_cm2 || g_cm3)) return 0;
+    if (m != WM_INITMENUPOPUP && m != WM_DRAWITEM && m != WM_MEASUREITEM && m != WM_MENUCHAR) return 0;
+    if (g_cm3) {
+        LRESULT lr = 0;
+        if (SUCCEEDED(g_cm3->lpVtbl->HandleMenuMsg2(g_cm3, m, w, l, &lr))) { *r = lr; return 1; }
+    } else if (SUCCEEDED(g_cm2->lpVtbl->HandleMenuMsg(g_cm2, m, w, l))) { *r = (m == WM_INITMENUPOPUP) ? 0 : TRUE; return 1; }
+    return 0;
+}
+/* выполнение команды над файлом пункта (общее для контекстного меню и средней кнопки) */
+static void DoEntryCmd(int cx, int sec, int idx, const wchar_t *path, POINT pt) {
+    const Entry *e = &g_ent[sec][idx];
+    switch (cx) {
     case CX_SHELL: ShellContextMenu(path, pt); break;
     case CX_REVEAL: RevealPath(path); break;
     case CX_COPYPATH: {
@@ -3045,47 +3123,112 @@ static void ShowEntryContext(void) {
     case CX_EDIT: OpenInEditor(path); break;
     }
 }
-/* правый клик по пункту нашего меню: запоминаем пункт и закрываем меню (контекстное меню покажем после этого) */
-static int CtxFromItem(HMENU hm, int pos, POINT pt) { /* 1 = клик обработан (пункт — файл/папка) */
-    if (!hm || pos < 0) return 0;
-    UINT id = GetMenuItemID(hm, pos);
-    if (id < ID_ENT0 || id >= ID_ENT0 + NSEC * MAXE) return 0;
-    int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
-    wchar_t tp[1100];
-    int ex = 0;
-    if (idx >= g_cnt[sec] || !EntryTarget(&g_ent[sec][idx], tp, 1100, &ex)) return 0;
-    g_ctxSec = sec;
-    g_ctxIdx = idx;
-    g_ctxPt = pt;
-    EndMenu();
+/* контекстное меню пункта; 1 = выбрана команда */
+static int ShowEntryContext(int sec, int idx, POINT pt) {
+    int exists = 0;
+    wchar_t path[1100];
+    if (sec < 0 || sec >= NSEC || idx < 0 || idx >= g_cnt[sec]) return 0;
+    Entry *e = &g_ent[sec][idx];
+    if (!EntryTarget(e, path, 1100, &exists)) return 0;
+    int isDir = exists && IsDirPath(path);
+    int script = exists && !isDir && (sec == SEC_SCRIPT || IsScriptExt(path));
+    UINT gr = exists ? 0 : MF_GRAYED;
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | gr, CX_SHELL, L"Контекстное меню Explorer");
+    AppendMenuW(m, MF_STRING | gr, CX_REVEAL, L"Показать в папке");
+    AppendMenuW(m, MF_STRING, CX_COPYPATH, L"Скопировать путь");
+    AppendMenuW(m, MF_STRING | gr, CX_COPYFILE, L"Скопировать");
+    AppendMenuW(m, MF_STRING | gr, CX_PROPS, L"Свойства");
+    if (script) {
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(m, MF_STRING, CX_EDIT, g_cfg.editor[0] ? L"Открыть в текстовом редакторе" : L"Открыть в блокноте");
+    }
+    HWND owner = g_menuOwner ? g_menuOwner : g_ctl;
+    if (!g_menuOwner) { g_inMenu = 1; SetForegroundWindow(g_ctl); }
+    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | (g_menuOwner ? TPM_RECURSE : 0), pt.x, pt.y, 0, owner, NULL);
+    PostMessageW(owner, WM_NULL, 0, 0);
+    if (!g_menuOwner) g_inMenu = 0;
+    DestroyMenu(m);
+    if (cmd) DoEntryCmd(cmd, sec, idx, path, pt);
+    return cmd ? 1 : 0;
+}
+/* действие средней кнопки по пункту (0 нет, 1 админ, 2 в папке, 3 редактор, 4 путь, 5 меню Explorer, 6 свойства, 7 копировать файл) */
+static int DoMiddle(int sec, int idx, POINT pt) {
+    int act = g_cfg.midAct[sec], exists = 0;
+    wchar_t path[1100];
+    if (act <= 0 || sec < 0 || sec >= NSEC || idx < 0 || idx >= g_cnt[sec]) return 0;
+    Entry *e = &g_ent[sec][idx];
+    if (e->type != 0) return 0;
+    int isFile = EntryTarget(e, path, 1100, &exists);
+    if (act == 1) { /* запуск от имени администратора */
+        if (sec == SEC_SCRIPT) { static Entry c; c = *e; c.flags |= 1; RunScript(&c); }
+        else if (sec == SEC_PROG) RunSpecV(e->action, e->args, g_nmb ? g_mb[0] : NULL, L"runas");
+        else RunEntry(sec, idx, g_nmb ? g_mb[0] : NULL);
+        return 1;
+    }
+    if (!isFile || !exists) return 0;
+    static const int map[8] = { 0, 0, CX_REVEAL, CX_EDIT, CX_COPYPATH, CX_SHELL, CX_PROPS, CX_COPYFILE };
+    DoEntryCmd(map[act], sec, idx, path, pt);
     return 1;
+}
+static void OnItemClick(WPARAM w, LPARAM l) {
+    int kind = (int)((w >> 24) & 0xFF), sec = (int)((w >> 16) & 0xFF), idx = (int)(w & 0xFFFF);
+    POINT pt = { (short)LOWORD(l), (short)HIWORD(l) };
+    if (g_itemBusy) return;
+    g_itemBusy = 1;
+    int done = (kind == 0) ? ShowEntryContext(sec, idx, pt) : DoMiddle(sec, idx, pt);
+    g_itemBusy = 0;
+    if (done && g_menuOwner) EndMenu(); /* после выполнения команды закрываем основное меню; если контекстное меню закрыли без выбора, основное остаётся */
+}
+static int EntryAtPoint(POINT pt, int *sec, int *idx) { /* запись, на которую указывает курсор в открытом меню */
+    if (!g_selMenu) return 0;
+    int pos = MenuItemFromPoint(NULL, g_selMenu, pt);
+    if (pos < 0) return 0;
+    UINT id = GetMenuItemID(g_selMenu, pos);
+    if (id < ID_ENT0 || id >= ID_ENT0 + NSEC * MAXE) return 0;
+    *sec = (int)(id - ID_ENT0) / MAXE;
+    *idx = (int)(id - ID_ENT0) % MAXE;
+    return *idx < g_cnt[*sec];
+}
+static void PostItemClick(int kind, int sec, int idx, POINT pt) {
+    if (g_menuOwner) PostMessageW(g_menuOwner, WM_ITEMCLICK, (WPARAM)(((UINT)kind << 24) | ((UINT)sec << 16) | (UINT)idx), MAKELPARAM((short)pt.x, (short)pt.y));
 }
 static void OnMenuRButtonUp(int pos, HMENU hm) { /* WM_MENURBUTTONUP: запасной путь, если перехватчик не сработал */
     POINT pt;
-    if (g_ctxSec >= 0) return;
+    UINT id = hm ? GetMenuItemID(hm, pos) : 0;
+    if (g_itemBusy || id < ID_ENT0 || id >= ID_ENT0 + NSEC * MAXE) return;
     GetCursorPos(&pt);
-    CtxFromItem(hm, pos, pt);
+    int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
+    wchar_t tp[1100];
+    int ex = 0;
+    if (idx < g_cnt[sec] && EntryTarget(&g_ent[sec][idx], tp, 1100, &ex)) PostItemClick(0, sec, idx, pt);
 }
-/* перехват правой кнопки в нашем всплывающем меню (пока оно открыто) */
+/* перехват правой и средней кнопок в нашем открытом меню */
 static LRESULT CALLBACK MenuHookProc(int code, WPARAM w, LPARAM l) {
     if (code == MSGF_MENU) {
         MSG *m = (MSG *)l;
-        if (m->message == WM_RBUTTONUP && g_selMenu) {
-            int pos = MenuItemFromPoint(NULL, g_selMenu, m->pt);
-            if (pos >= 0) {
-                CtxFromItem(g_selMenu, pos, m->pt);
-                return 1; /* правый клик не должен запускать пункт */
+        if (m->message == WM_RBUTTONUP || m->message == WM_MBUTTONUP) {
+            int sec = 0, idx = 0;
+            if (EntryAtPoint(m->pt, &sec, &idx)) {
+                if (m->message == WM_RBUTTONUP) {
+                    wchar_t tp[1100];
+                    int ex = 0;
+                    if (EntryTarget(&g_ent[sec][idx], tp, 1100, &ex)) PostItemClick(0, sec, idx, m->pt);
+                } else if (g_cfg.midAct[sec] > 0) PostItemClick(1, sec, idx, m->pt);
+                return 1; /* клик не должен запускать пункт */
             }
         }
     }
     return CallNextHookEx(g_mhook, code, w, l);
 }
 static int TrackWithHook(HWND owner, HMENU m, POINT pt) {
-    g_ctxSec = -1;
     g_selMenu = NULL;
+    g_itemBusy = 0;
+    g_menuOwner = owner;
     g_mhook = SetWindowsHookExW(WH_MSGFILTER, MenuHookProc, NULL, GetCurrentThreadId());
     int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD, pt.x, pt.y, 0, owner, NULL); /* без TPM_RIGHTBUTTON: правый клик пункт не запускает */
     if (g_mhook) { UnhookWindowsHookEx(g_mhook); g_mhook = NULL; }
+    g_menuOwner = NULL;
     PostMessageW(owner, WM_NULL, 0, 0);
     return cmd;
 }
@@ -3103,7 +3246,6 @@ static void ShowMenu(MonBtn *b) {
     TipHide();
     DestroyMenu(m);
     if (cmd) HandleCmd(cmd, b);
-    else if (g_ctxSec >= 0) ShowEntryContext();
 }
 
 /* ---------- оконные процедуры ---------- */
@@ -3120,7 +3262,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_NCCREATE) SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW *)l)->lpCreateParams);
     MonBtn *b = (MonBtn *)GetWindowLongPtrW(h, GWLP_USERDATA);
     if (!b) return DefWindowProcW(h, m, w, l);
+    { LRESULT cr = 0; if (CmForward(m, w, l, &cr)) return cr; }
     switch (m) {
+    case WM_ITEMCLICK: OnItemClick(w, l); return 0;
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
@@ -3201,7 +3345,6 @@ static void ShowTrayMenu(void) {
     TipHide();
     DestroyMenu(m);
     if (cmd) HandleCmd(cmd, g_nmb ? g_mb[0] : NULL);
-    else if (g_ctxSec >= 0) ShowEntryContext();
 }
 static void CALLBACK FgHook(HWINEVENTHOOK hk, DWORD ev, HWND w, LONG idObj, LONG idChild, DWORD th, DWORD ms) {
     (void)hk; (void)ev; (void)idChild; (void)th; (void)ms;
@@ -3211,11 +3354,7 @@ static void CALLBACK FgHook(HWINEVENTHOOK hk, DWORD ev, HWND w, LONG idObj, LONG
 }
 static LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (g_wmTaskbar && m == g_wmTaskbar) { TrayAdd(); return 0; } /* проводник перезапущен */
-    if ((g_cm2 || g_cm3) && (m == WM_INITMENUPOPUP || m == WM_DRAWITEM || m == WM_MEASUREITEM || m == WM_MENUCHAR)) {
-        LRESULT r = 0;
-        if (g_cm3) { if (SUCCEEDED(g_cm3->lpVtbl->HandleMenuMsg2(g_cm3, m, w, l, &r))) return r; }
-        else if (SUCCEEDED(g_cm2->lpVtbl->HandleMenuMsg(g_cm2, m, w, l))) return (m == WM_INITMENUPOPUP) ? 0 : TRUE;
-    }
+    { LRESULT cr = 0; if (CmForward(m, w, l, &cr)) return cr; }
     switch (m) {
     case WM_TRAY:
         if (g_modal) return 0;
@@ -3223,6 +3362,7 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         else if (l == WM_RBUTTONUP || l == WM_CONTEXTMENU) ShowTrayMenu();
         return 0;
     case WM_MENUSELECT: OnMenuSelect(w, l); return 0;
+    case WM_ITEMCLICK: OnItemClick(w, l); return 0;
     case WM_MENURBUTTONUP: OnMenuRButtonUp((int)w, (HMENU)l); return 0;
     case WM_APP + 5: ShowSettings(); return 0;
     case WM_DISPLAYCHANGE: SetTimer(h, 9, 700, NULL); return 0;
