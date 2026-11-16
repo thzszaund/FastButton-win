@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.6.1"
+#define APPVER L"2.7.0"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -74,7 +74,7 @@ static HTREEITEM g_htis[NSEC][MAXE];
 #define g_tree g_trees[g_cur]
 #define g_hti g_htis[g_cur]
 static Act g_click, g_dbl, g_mid;
-static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; } g_cfg;
+static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; int midItem; } g_cfg;
 static wchar_t g_excl[MAXLIST][64], g_remote[MAXLIST][64];
 static int g_nexcl, g_nremote;
 static HICON g_icon;
@@ -380,6 +380,7 @@ static void LoadAll(void) {
     g_cfg.raisePinned = GetI(L"Options", L"RaisePinned", 1) ? 1 : 0;
     g_cfg.show = GetI(L"Options", L"ShowButtons", 1) ? 1 : 0;
     GetS(L"Options", L"TextEditor", L"", g_cfg.editor, MAX_PATH * 2);
+    g_cfg.midItem = Clamp(GetI(L"Options", L"MenuMiddleClick", 1), 0, 6);
     g_debug = GetI(L"Options", L"Debug", 0) ? 1 : 0;
     GetS(L"Button", L"Color", L"3399FF", b, 64);
     g_cfg.color = ParseColor(b, RGB(0x33, 0x99, 0xFF));
@@ -427,6 +428,7 @@ static void SaveCfg(void) {
     PutI(L"Options", L"Debug", g_debug);
     PutI(L"Options", L"ShowButtons", g_cfg.show);
     PutS(L"Options", L"TextEditor", g_cfg.editor);
+    PutI(L"Options", L"MenuMiddleClick", g_cfg.midItem);
 }
 /* ---------- настройки мониторов ---------- */
 static void MonKey(const wchar_t *dev, wchar_t *out) {
@@ -2436,7 +2438,7 @@ typedef struct {
     int mdx[MAXMON], mdy[MAXMON];
     HWND chPinTop, chPinAll, chRaise, chKeep, chLocal;
     HWND eExcl, eRemote;
-    HWND chAuto, chDebug, eEditor;
+    HWND chAuto, chDebug, eEditor, cbMid;
 } SetDlg;
 static Entry g_bak[NSEC][MAXE];
 static int g_bakn[NSEC];
@@ -2626,8 +2628,15 @@ static void PgGen(SetDlg *s, HWND pg) {
     s->eEditor = Edt(pg, 12, 126, 540, 24, 906);
     SetWindowTextW(s->eEditor, g_cfg.editor);
     Btn(pg, L"Обзор…", 560, 126, 110, 24, 907, 0);
-    Btn(pg, L"Открыть файл настроек (.ini)", 12, 176, 300, 30, 903, 0);
-    Btn(pg, L"Перечитать настройки из .ini", 12, 214, 300, 30, 904, 0);
+    Lbl(pg, L"Средняя кнопка мыши на пункте меню:", 12, 166, 330, 24);
+    s->cbMid = Mk(pg, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, 350, 162, 320, 220, 908);
+    {
+        static const wchar_t *mi[] = { L"Ничего не делать", L"Показать в папке", L"Скопировать путь", L"Скопировать (файл в буфер)", L"Контекстное меню Explorer", L"Свойства", L"Открыть в текстовом редакторе (скрипты)" };
+        for (int i = 0; i < 7; i++) SendMessageW(s->cbMid, CB_ADDSTRING, 0, (LPARAM)mi[i]);
+        SendMessageW(s->cbMid, CB_SETCURSEL, g_cfg.midItem, 0);
+    }
+    Btn(pg, L"Открыть файл настроек (.ini)", 12, 216, 300, 30, 903, 0);
+    Btn(pg, L"Перечитать настройки из .ini", 12, 254, 300, 30, 904, 0);
     Btn(pg, L"Скопировать журнал в буфер обмена", 12, 252, 300, 30, 905, 0);
     Lbl(pg, L"CornerBtn версия " APPVER L"  ·  github.com/thzszaund/FastButton-win", 12, 306, 700, 20);
 }
@@ -2667,6 +2676,7 @@ static int SetApply(SetDlg *s) {
     EditToLines(s->eRemote, g_remote, &g_nremote);
     GetWindowTextW(s->eEditor, g_cfg.editor, MAX_PATH * 2);
     Trim(g_cfg.editor);
+    { int mi = (int)SendMessageW(s->cbMid, CB_GETCURSEL, 0, 0); if (mi >= 0 && mi <= 6) g_cfg.midItem = mi; }
     if (Chk(s->chAuto) != AutoGet()) AutoSet(Chk(s->chAuto));
     int dbg = Chk(s->chDebug);
     if (dbg != g_debug) { g_debug = dbg; if (dbg) { DeleteFileW(g_log); LogStartup(); } }
@@ -3092,6 +3102,27 @@ static int CtxFromItem(HMENU hm, int pos, POINT pt) { /* 1 = клик обраб
     }
     return 1;
 }
+static int MidFromItem(HMENU hm, int pos, POINT pt) { /* средняя кнопка на пункте: действие из настроек, выполняется после закрытия меню */
+    static const int map[] = { 0, CX_REVEAL, CX_COPYPATH, CX_COPYFILE, CX_SHELL, CX_PROPS, CX_EDIT };
+    if (!hm || pos < 0 || g_nested) return 0;
+    UINT id = GetMenuItemID(hm, pos);
+    if (id < ID_ENT0 || id >= ID_ENT0 + NSEC * MAXE) return 0;
+    int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
+    wchar_t tp[1100];
+    int ex = 0;
+    if (idx >= g_cnt[sec] || !EntryTarget(&g_ent[sec][idx], tp, 1100, &ex)) return 0;
+    int cmd = map[g_cfg.midItem];
+    if (!cmd) return 1;
+    if (cmd == CX_EDIT && !(ex && !IsDirPath(tp) && (sec == SEC_SCRIPT || IsScriptExt(tp)))) cmd = CX_REVEAL; /* не скрипт: показать в папке */
+    if (!ex && cmd != CX_COPYPATH) return 1;
+    TipHide();
+    g_ctxSec = sec;
+    g_ctxIdx = idx;
+    g_ctxPt = pt;
+    g_pendCmd = cmd;
+    EndMenu();
+    return 1;
+}
 static void OnMenuRButtonUp(int pos, HMENU hm) { /* WM_MENURBUTTONUP: запасной путь, если перехватчик не сработал */
     POINT pt;
     if (g_ctxSec >= 0) return;
@@ -3102,6 +3133,10 @@ static void OnMenuRButtonUp(int pos, HMENU hm) { /* WM_MENURBUTTONUP: запас
 static LRESULT CALLBACK MenuHookProc(int code, WPARAM w, LPARAM l) {
     if (code == MSGF_MENU) {
         MSG *m = (MSG *)l;
+        if (m->message == WM_MBUTTONUP && g_selMenu && !g_nested) {
+            int pos = MenuItemFromPoint(NULL, g_selMenu, m->pt);
+            if (pos >= 0 && MidFromItem(g_selMenu, pos, m->pt)) return 1;
+        }
         if (m->message == WM_RBUTTONUP && g_selMenu) {
             int pos = MenuItemFromPoint(NULL, g_selMenu, m->pt);
             if (pos >= 0) {
