@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.6.0"
+#define APPVER L"2.6.1"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -1405,19 +1405,29 @@ static void TipShow(const wchar_t *text, int x, int y) {
     SendMessageW(g_tip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&g_ti);
 }
 static HMENU g_selMenu; /* меню, в котором сейчас выделен пункт */
+static int g_nested; /* 1 = поверх нашего меню открыто контекстное меню пункта */
+static int EntryTarget(const Entry *e, wchar_t *out, int n, int *exists);
 static void OnMenuSelect(WPARAM w, LPARAM l) {
     UINT id = LOWORD(w), fl = HIWORD(w);
     HMENU hm = (HMENU)l;
+    if (g_nested) return;
     if (hm) g_selMenu = hm;
     if (!hm || fl == 0xFFFF || (fl & (MF_POPUP | MF_SEPARATOR)) || !id) { TipHide(); return; }
     if (id >= ID_ENT0 && id < ID_ENT0 + NSEC * MAXE) {
         int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
-        if (idx < g_cnt[sec] && g_ent[sec][idx].note[0]) {
+        static wchar_t tipPath[1100];
+        const wchar_t *tip = NULL;
+        if (idx < g_cnt[sec]) {
+            int ex = 0;
+            if (g_ent[sec][idx].note[0]) tip = g_ent[sec][idx].note;
+            else if (g_ent[sec][idx].type == 0 && EntryTarget(&g_ent[sec][idx], tipPath, 1100, &ex)) tip = tipPath; /* нет подсказки: полный путь */
+        }
+        if (tip) {
             int n = GetMenuItemCount(hm);
             for (int p = 0; p < n; p++) {
                 if (GetMenuItemID(hm, p) == id) {
                     RECT rc;
-                    if (GetMenuItemRect(NULL, hm, (UINT)p, &rc)) { TipShow(g_ent[sec][idx].note, rc.right + 2, rc.top); return; }
+                    if (GetMenuItemRect(NULL, hm, (UINT)p, &rc)) { TipShow(tip, rc.right + 2, rc.top); return; }
                 }
             }
         }
@@ -2997,14 +3007,13 @@ static void ShellContextMenu(const wchar_t *path, POINT pt) { /* обычное 
     }
     CoTaskMemFree(pidl);
 }
-static void ShowEntryContext(void) {
-    int sec = g_ctxSec, idx = g_ctxIdx, exists = 0;
-    POINT pt = g_ctxPt;
+static int g_pendCmd; /* команда контекстного меню, выбранная при открытом основном меню */
+static int EntryCtxChoose(int sec, int idx, POINT pt) { /* показать контекстное меню пункта, вернуть команду */
+    int exists = 0;
     wchar_t path[1100];
-    g_ctxSec = -1;
-    if (sec < 0 || sec >= NSEC || idx < 0 || idx >= g_cnt[sec]) return;
+    if (sec < 0 || sec >= NSEC || idx < 0 || idx >= g_cnt[sec]) return 0;
     Entry *e = &g_ent[sec][idx];
-    if (!EntryTarget(e, path, 1100, &exists)) return;
+    if (!EntryTarget(e, path, 1100, &exists)) return 0;
     int isDir = exists && IsDirPath(path);
     int script = exists && !isDir && (sec == SEC_SCRIPT || IsScriptExt(path));
     UINT gr = exists ? 0 : MF_GRAYED;
@@ -3019,11 +3028,19 @@ static void ShowEntryContext(void) {
         AppendMenuW(m, MF_STRING, CX_EDIT, g_cfg.editor[0] ? L"Открыть в текстовом редакторе" : L"Открыть в блокноте");
     }
     g_inMenu = 1;
-    SetForegroundWindow(g_ctl);
+    if (!g_nested) SetForegroundWindow(g_ctl);
     int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_ctl, NULL);
     PostMessageW(g_ctl, WM_NULL, 0, 0);
-    g_inMenu = 0;
+    if (!g_nested) g_inMenu = 0;
     DestroyMenu(m);
+    return cmd;
+}
+static void EntryCtxRun(int sec, int idx, POINT pt, int cmd) { /* выполнить выбранную команду */
+    int exists = 0;
+    wchar_t path[1100];
+    if (cmd <= 0 || sec < 0 || sec >= NSEC || idx < 0 || idx >= g_cnt[sec]) return;
+    Entry *e = &g_ent[sec][idx];
+    if (!EntryTarget(e, path, 1100, &exists)) return;
     switch (cmd) {
     case CX_SHELL: ShellContextMenu(path, pt); break;
     case CX_REVEAL: RevealPath(path); break;
@@ -3045,19 +3062,34 @@ static void ShowEntryContext(void) {
     case CX_EDIT: OpenInEditor(path); break;
     }
 }
-/* правый клик по пункту нашего меню: запоминаем пункт и закрываем меню (контекстное меню покажем после этого) */
+static void ShowEntryContext(void) { /* после закрытия основного меню: выполнить отложенную команду (или показать меню) */
+    int sec = g_ctxSec, idx = g_ctxIdx, cmd = g_pendCmd;
+    POINT pt = g_ctxPt;
+    g_ctxSec = -1;
+    g_pendCmd = 0;
+    if (!cmd) cmd = EntryCtxChoose(sec, idx, pt);
+    EntryCtxRun(sec, idx, pt, cmd);
+}
+/* правый клик по пункту нашего меню: контекстное меню поверх открытого меню, которое остаётся на экране */
 static int CtxFromItem(HMENU hm, int pos, POINT pt) { /* 1 = клик обработан (пункт — файл/папка) */
-    if (!hm || pos < 0) return 0;
+    if (!hm || pos < 0 || g_nested) return 0;
     UINT id = GetMenuItemID(hm, pos);
     if (id < ID_ENT0 || id >= ID_ENT0 + NSEC * MAXE) return 0;
     int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
     wchar_t tp[1100];
     int ex = 0;
     if (idx >= g_cnt[sec] || !EntryTarget(&g_ent[sec][idx], tp, 1100, &ex)) return 0;
-    g_ctxSec = sec;
-    g_ctxIdx = idx;
-    g_ctxPt = pt;
-    EndMenu();
+    TipHide();
+    g_nested = 1;
+    int cmd = EntryCtxChoose(sec, idx, pt);
+    g_nested = 0;
+    if (cmd > 0) { /* команду выполним после закрытия основного меню */
+        g_ctxSec = sec;
+        g_ctxIdx = idx;
+        g_ctxPt = pt;
+        g_pendCmd = cmd;
+        EndMenu();
+    }
     return 1;
 }
 static void OnMenuRButtonUp(int pos, HMENU hm) { /* WM_MENURBUTTONUP: запасной путь, если перехватчик не сработал */
@@ -3082,6 +3114,8 @@ static LRESULT CALLBACK MenuHookProc(int code, WPARAM w, LPARAM l) {
 }
 static int TrackWithHook(HWND owner, HMENU m, POINT pt) {
     g_ctxSec = -1;
+    g_pendCmd = 0;
+    g_nested = 0;
     g_selMenu = NULL;
     g_mhook = SetWindowsHookExW(WH_MSGFILTER, MenuHookProc, NULL, GetCurrentThreadId());
     int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD, pt.x, pt.y, 0, owner, NULL); /* без TPM_RIGHTBUTTON: правый клик пункт не запускает */
