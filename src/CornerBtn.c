@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.9.0"
+#define APPVER L"2.10.0"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -75,10 +75,11 @@ static HTREEITEM g_htis[NSEC][MAXE];
 #define g_tree g_trees[g_cur]
 #define g_hti g_htis[g_cur]
 static Act g_click, g_dbl, g_mid;
-static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; int midItem; } g_cfg;
+static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; int midItem; int content, numBold, numScale, trayNum, trayBold; wchar_t numFont[64], trayFont[64]; COLORREF numFg, numFgH, numBg, numBgH, trayFg, trayBg; } g_cfg; /* content: 0 цвет, 1 иконка, 2 номер стола */
 static wchar_t g_excl[MAXLIST][64], g_remote[MAXLIST][64];
 static int g_nexcl, g_nremote;
 static HICON g_icon;
+static int g_deskNum; /* номер текущего виртуального стола (0 = неизвестен) */
 static int g_inMenu, g_modal, g_debug;
 static wchar_t g_log[MAX_PATH];
 static HWND g_prevFg, g_lastFg;
@@ -402,6 +403,19 @@ static void LoadAll(void) {
     GetS(L"Button", L"Color", L"3399FF", b, 64);
     g_cfg.color = ParseColor(b, RGB(0x33, 0x99, 0xFF));
     GetS(L"Button", L"Icon", L"", g_cfg.icon, MAX_PATH);
+    g_cfg.content = Clamp(GetI(L"Button", L"Content", g_cfg.icon[0] ? 1 : 0), 0, 2);
+    GetS(L"NumButton", L"Font", L"Segoe UI", g_cfg.numFont, 64);
+    g_cfg.numBold = GetI(L"NumButton", L"Bold", 1) ? 1 : 0;
+    g_cfg.numScale = Clamp(GetI(L"NumButton", L"ScalePercent", 75), 20, 100);
+    GetS(L"NumButton", L"TextColor", L"FFFFFF", b, 64);       g_cfg.numFg = ParseColor(b, RGB(255, 255, 255));
+    GetS(L"NumButton", L"TextColorHover", L"FFFFFF", b, 64);  g_cfg.numFgH = ParseColor(b, RGB(255, 255, 255));
+    GetS(L"NumButton", L"BgColor", L"3399FF", b, 64);         g_cfg.numBg = ParseColor(b, RGB(0x33, 0x99, 0xFF));
+    GetS(L"NumButton", L"BgColorHover", L"1166CC", b, 64);    g_cfg.numBgH = ParseColor(b, RGB(0x11, 0x66, 0xCC));
+    g_cfg.trayNum = GetI(L"NumTray", L"Enabled", 0) ? 1 : 0;
+    GetS(L"NumTray", L"Font", L"Segoe UI", g_cfg.trayFont, 64);
+    g_cfg.trayBold = GetI(L"NumTray", L"Bold", 1) ? 1 : 0;
+    GetS(L"NumTray", L"TextColor", L"FFFFFF", b, 64);  g_cfg.trayFg = ParseColor(b, RGB(255, 255, 255));
+    GetS(L"NumTray", L"BgColor", L"3399FF", b, 64);    g_cfg.trayBg = ParseColor(b, RGB(0x33, 0x99, 0xFF));
 
     GetS(L"Click", L"Action", L"@mondesk", g_click.action, 520);
     GetS(L"Click", L"Args", L"", g_click.args, 260);
@@ -449,6 +463,21 @@ static void SaveCfg(void) {
     PutI(L"Options", L"ShowButtons", g_cfg.show);
     PutS(L"Options", L"TextEditor", g_cfg.editor);
     PutI(L"Options", L"MenuMiddleClick", g_cfg.midItem);
+    PutI(L"Button", L"Content", g_cfg.content);
+    PutS(L"NumButton", L"Font", g_cfg.numFont);
+    PutI(L"NumButton", L"Bold", g_cfg.numBold);
+    PutI(L"NumButton", L"ScalePercent", g_cfg.numScale);
+    PutI(L"NumTray", L"Enabled", g_cfg.trayNum);
+    PutS(L"NumTray", L"Font", g_cfg.trayFont);
+    PutI(L"NumTray", L"Bold", g_cfg.trayBold);
+#define PUTCOL(sec, key, c) do { _snwprintf(b, 32, L"%02X%02X%02X", GetRValue(c), GetGValue(c), GetBValue(c)); b[31] = 0; PutS(sec, key, b); } while (0)
+    PUTCOL(L"NumButton", L"TextColor", g_cfg.numFg);
+    PUTCOL(L"NumButton", L"TextColorHover", g_cfg.numFgH);
+    PUTCOL(L"NumButton", L"BgColor", g_cfg.numBg);
+    PUTCOL(L"NumButton", L"BgColorHover", g_cfg.numBgH);
+    PUTCOL(L"NumTray", L"TextColor", g_cfg.trayFg);
+    PUTCOL(L"NumTray", L"BgColor", g_cfg.trayBg);
+#undef PUTCOL
     PutI(L"DeskOverlay", L"Show", g_ov.show);
     PutS(L"DeskOverlay", L"Font", g_ov.font);
     PutI(L"DeskOverlay", L"Size", g_ov.size);
@@ -661,6 +690,7 @@ static int ReadCurDesk(GUID *g) {
 
 /* ---------- переключение виртуальных столов по кругу + оверлей с номером ---------- */
 static void LocalizeFocus(MonBtn *b);
+static void DeskNumChanged(void);
 static int g_ovTick, g_ovNum;
 static HWND g_ovWnd;
 static int DeskInfo(int *idx) { /* число столов и индекс текущего (из реестра); idx=-1 если не определён */
@@ -809,6 +839,7 @@ static void CheckDesktopSwitch(void) {
             if (g_debug) { HWND fg = GetForegroundWindow(); wchar_t dd[700]; if (fg) { DescWin(fg, dd, 700); Log(L"  активное окно сейчас: %ls", dd); } }
             g_raiseTicks = 5;
             g_ovTick = 1;
+            DeskNumChanged();
         }
     } else if (g_vdm && g_npinned) { /* запасной способ: по активному окну */
         HWND fg = GetForegroundWindow();
@@ -1093,7 +1124,7 @@ static void RunAct(const Act *a, MonBtn *b) { g_runHide = a->hide; RunSpec(a->ac
 /* ---------- кнопки на мониторах ---------- */
 static void LoadIconCfg(void) {
     if (g_icon) { DestroyIcon(g_icon); g_icon = NULL; }
-    if (!g_cfg.icon[0] || g_cfg.size < 10) return;
+    if (g_cfg.content != 1 || !g_cfg.icon[0] || g_cfg.size < 10) return;
     if (!wcscmp(g_cfg.icon, L"@app")) { /* значок самой программы */
         g_icon = (HICON)LoadImageW(g_hinst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, g_cfg.size, g_cfg.size, 0);
         return;
@@ -1810,15 +1841,69 @@ static void TrayTip(wchar_t *tip, int n) {
     _snwprintf(tip, (size_t)n, L"CornerBtn %ls — кнопка в углу: %ls", APPVER, g_cfg.show ? L"показана" : L"скрыта");
     tip[n - 1] = 0;
 }
-static int TrayAdd(void) {
+static HICON g_trayNumIcon;
+static HICON MakeNumIcon(int num, const wchar_t *font, int bold, COLORREF fg, COLORREF bg) {
+    int sz = GetSystemMetrics(SM_CXSMICON);
+    if (sz < 16) sz = 16;
+    HDC sdc = GetDC(NULL);
+    HDC dc = CreateCompatibleDC(sdc);
+    HBITMAP col = CreateCompatibleBitmap(sdc, sz, sz);
+    HBITMAP old = (HBITMAP)SelectObject(dc, col);
+    RECT r = { 0, 0, sz, sz };
+    HBRUSH br = CreateSolidBrush(bg);
+    FillRect(dc, &r, br);
+    DeleteObject(br);
+    wchar_t t[16];
+    if (num > 0) _snwprintf(t, 16, L"%d", num); else cp(t, 16, L"?");
+    t[15] = 0;
+    int h = wcslen(t) > 1 ? sz * 3 / 4 : sz * 19 / 20;
+    HFONT f = CreateFontW(-h, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, font);
+    HFONT of = (HFONT)SelectObject(dc, f);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, fg);
+    DrawTextW(dc, t, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, of);
+    DeleteObject(f);
+    SelectObject(dc, old);
+    HBITMAP mask = CreateBitmap(sz, sz, 1, 1, NULL);
+    HDC mdc = CreateCompatibleDC(sdc);
+    HBITMAP mo = (HBITMAP)SelectObject(mdc, mask);
+    PatBlt(mdc, 0, 0, sz, sz, BLACKNESS); /* маска «всё непрозрачно» */
+    SelectObject(mdc, mo);
+    DeleteDC(mdc);
+    ICONINFO ii;
+    memset(&ii, 0, sizeof ii);
+    ii.fIcon = TRUE;
+    ii.hbmMask = mask;
+    ii.hbmColor = col;
+    HICON ic = CreateIconIndirect(&ii);
+    DeleteObject(mask);
+    DeleteObject(col);
+    DeleteDC(dc);
+    ReleaseDC(NULL, sdc);
+    return ic;
+}
+static HICON TrayCurIcon(void) {
+    if (g_cfg.trayNum) {
+        HICON ic = MakeNumIcon(g_deskNum, g_cfg.trayFont, g_cfg.trayBold, g_cfg.trayFg, g_cfg.trayBg);
+        if (ic) {
+            if (g_trayNumIcon) DestroyIcon(g_trayNumIcon);
+            g_trayNumIcon = ic;
+            return ic;
+        }
+    }
     if (!g_trayIcon) g_trayIcon = (HICON)LoadImageW(g_hinst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    return g_trayIcon;
+}
+static int TrayAdd(void) {
+    HICON cur = TrayCurIcon();
     memset(&g_nid, 0, sizeof g_nid);
     g_nid.cbSize = sizeof g_nid;
     g_nid.hWnd = g_ctl;
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    g_nid.hIcon = g_trayIcon;
+    g_nid.hIcon = cur;
     TrayTip(g_nid.szTip, 128);
     g_trayOn = Shell_NotifyIconW(NIM_ADD, &g_nid) ? 1 : 0;
     return g_trayOn;
@@ -1829,8 +1914,17 @@ static void TrayRemove(void) {
 static void TrayUpdate(void) {
     if (!g_trayOn) return;
     TrayTip(g_nid.szTip, 128);
+    g_nid.hIcon = TrayCurIcon();
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+static void DeskNumChanged(void) { /* обновить номер стола на кнопках и в трее */
+    int idx, n = DeskInfo(&idx);
+    int num = (n >= 1 && idx >= 0) ? idx + 1 : 0;
+    int changed = num != g_deskNum;
+    g_deskNum = num;
+    if (g_cfg.content == 2) for (int i = 0; i < g_nmb; i++) if (g_mb[i] && g_mb[i]->hwnd) InvalidateRect(g_mb[i]->hwnd, NULL, FALSE);
+    if (changed && g_cfg.trayNum) TrayUpdate();
 }
 static void Balloon(const wchar_t *title, const wchar_t *msg) {
     if (!g_trayOn) return;
@@ -2616,7 +2710,7 @@ static LRESULT CALLBACK TreeSub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id,
 }
 
 /* ---------- окно настроек со вкладками ---------- */
-enum { TAB_PROG = 0, TAB_SCRIPT, TAB_FOLDER, TAB_FILES, TAB_APP, TAB_ACT, TAB_MON, TAB_PIN, TAB_DESK, TAB_EXCL, TAB_GEN, NTABS };
+enum { TAB_PROG = 0, TAB_SCRIPT, TAB_FOLDER, TAB_FILES, TAB_APP, TAB_ACT, TAB_MON, TAB_PIN, TAB_DESK, TAB_NUM, TAB_EXCL, TAB_GEN, NTABS };
 typedef struct {
     Dlg d;
     HWND tab, page[NTABS];
@@ -2629,6 +2723,7 @@ typedef struct {
     HWND chPinTop, chPinAll, chRaise, chKeep, chLocal;
     HWND eExcl, eRemote;
     HWND chAuto, chDebug, eEditor, cbMid;
+    HWND cbContent, eNFont, chNBold, eNScale, eNFg, eNFgH, eNBg, eNBgH, chTray, eTFont, chTBold, eTFg, eTBg;
     HWND chOv, chOvBold, eOvFont, eOvSize, eOvOp, eOvCol, eOvOut, eOvOutW, eOvDur, cbOvPos;
 } SetDlg;
 static Entry g_bak[NSEC][MAXE];
@@ -2688,7 +2783,7 @@ static LRESULT CALLBACK PageProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-static const wchar_t *const g_tabName[NTABS] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Внешний вид", L"Действия кнопки", L"Мониторы", L"Закрепление окон", L"Рабочие столы", L"Исключения", L"Общее" };
+static const wchar_t *const g_tabName[NTABS] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Внешний вид", L"Действия кнопки", L"Мониторы", L"Закрепление окон", L"Рабочие столы", L"Номер стола", L"Исключения", L"Общее" };
 static const wchar_t *const g_actTitle[3] = { L"Левый клик", L"Двойной левый клик", L"Средняя кнопка (колёсико)" };
 static const wchar_t *const g_cornerName[4] = { L"Левый верхний угол", L"Правый верхний угол", L"Левый нижний угол", L"Правый нижний угол" };
 
@@ -2748,6 +2843,13 @@ static void PgApp(SetDlg *s, HWND pg) {
     SendMessageW(s->cbShape, CB_ADDSTRING, 0, (LPARAM)L"Квадрат");
     SendMessageW(s->cbShape, CB_ADDSTRING, 0, (LPARAM)L"Круг");
     SendMessageW(s->cbShape, CB_SETCURSEL, g_cfg.shape, 0);
+    y += 34;
+    Lbl(pg, L"Содержимое кнопки:", 12, y + 3, 250, 20);
+    s->cbContent = Mk(pg, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, 270, y, 330, 160, 210);
+    SendMessageW(s->cbContent, CB_ADDSTRING, 0, (LPARAM)L"Только цвет (квадрат или круг)");
+    SendMessageW(s->cbContent, CB_ADDSTRING, 0, (LPARAM)L"Иконка (файл ниже)");
+    SendMessageW(s->cbContent, CB_ADDSTRING, 0, (LPARAM)L"Номер рабочего стола (вкладка «Номер стола»)");
+    SendMessageW(s->cbContent, CB_SETCURSEL, g_cfg.content, 0);
     y += 40;
     Lbl(pg, L"Иконка на кнопке: файл .ico/.exe/.dll или @app (значок программы). Пусто — без иконки. Рисуется при размере кнопки от 10.", 12, y, 640, 34);
     y += 38;
@@ -2853,6 +2955,43 @@ static void PickOvColor(SetDlg *s, HWND owner, HWND ed, COLORREF def) {
     }
 }
 static int EdI(HWND e, int lo, int hi, int def) { wchar_t b[32]; GetWindowTextW(e, b, 32); wchar_t *p; long v = wcstol(b, &p, 10); return (p == b) ? def : Clamp((int)v, lo, hi); }
+static void NumRow(HWND pg, SetDlg *s, HWND *ed, const wchar_t *lab, int y, int idEd, int idPick, COLORREF c) {
+    wchar_t b[16];
+    Lbl(pg, lab, 12, y + 3, 260, 20);
+    *ed = Edt(pg, 280, y, 90, 24, idEd);
+    _snwprintf(b, 16, L"%02X%02X%02X", GetRValue(c), GetGValue(c), GetBValue(c));
+    SetWindowTextW(*ed, b);
+    Btn(pg, L"Выбрать…", 380, y, 100, 24, idPick, 0);
+    (void)s;
+}
+static void PgNum(SetDlg *s, HWND pg) {
+    wchar_t b[16];
+    int y = 12;
+    Lbl(pg, L"Кнопка в углу в виде номера стола (включается на вкладке «Внешний вид» → «Содержимое кнопки»). Прозрачность — те же поля «Непрозрачность» и «…при наведении» на вкладке «Внешний вид».", 12, y, 740, 36);
+    y += 44;
+    Lbl(pg, L"Шрифт:", 12, y + 3, 260, 20);
+    s->eNFont = Edt(pg, 280, y, 200, 24, 961);
+    SetWindowTextW(s->eNFont, g_cfg.numFont);
+    s->chNBold = Chkbox(pg, L"Жирный", 500, y, 120, 962, g_cfg.numBold);
+    y += 30;
+    Lbl(pg, L"Размер цифры, % от кнопки (20–100):", 12, y + 3, 260, 20);
+    s->eNScale = Edt(pg, 280, y, 90, 24, 963);
+    _snwprintf(b, 16, L"%d", g_cfg.numScale); SetWindowTextW(s->eNScale, b);
+    y += 30;
+    NumRow(pg, s, &s->eNFg,  L"Цвет цифры, обычный (RRGGBB):",    y, 964, 965, g_cfg.numFg);  y += 30;
+    NumRow(pg, s, &s->eNFgH, L"Цвет цифры при наведении:",        y, 966, 967, g_cfg.numFgH); y += 30;
+    NumRow(pg, s, &s->eNBg,  L"Фон, обычный:",                    y, 968, 969, g_cfg.numBg);  y += 30;
+    NumRow(pg, s, &s->eNBgH, L"Фон при наведении:",               y, 970, 971, g_cfg.numBgH); y += 44;
+    s->chTray = Chkbox(pg, L"Значок в трее — номер текущего рабочего стола", 12, y, 740, 972, g_cfg.trayNum);
+    y += 30;
+    Lbl(pg, L"Шрифт значка в трее:", 12, y + 3, 260, 20);
+    s->eTFont = Edt(pg, 280, y, 200, 24, 973);
+    SetWindowTextW(s->eTFont, g_cfg.trayFont);
+    s->chTBold = Chkbox(pg, L"Жирный", 500, y, 120, 974, g_cfg.trayBold);
+    y += 30;
+    NumRow(pg, s, &s->eTFg, L"Цвет цифры в трее:", y, 975, 976, g_cfg.trayFg); y += 30;
+    NumRow(pg, s, &s->eTBg, L"Фон значка в трее:", y, 977, 978, g_cfg.trayBg);
+}
 static void PgExcl(SetDlg *s, HWND pg, int PW, int PH) {
     int eh = (PH - 190) / 2;
     if (eh < 60) eh = 60;
@@ -2938,6 +3077,25 @@ static int SetApply(SetDlg *s) {
         int pp = (int)SendMessageW(s->cbOvPos, CB_GETCURSEL, 0, 0);
         if (pp >= 0 && pp <= 8) g_ov.pos = pp;
     }
+    {
+        wchar_t b[64];
+        int ct = (int)SendMessageW(s->cbContent, CB_GETCURSEL, 0, 0);
+        if (ct >= 0 && ct <= 2) g_cfg.content = ct;
+        GetWindowTextW(s->eNFont, g_cfg.numFont, 64); Trim(g_cfg.numFont);
+        if (!g_cfg.numFont[0]) cp(g_cfg.numFont, 64, L"Segoe UI");
+        g_cfg.numBold = Chk(s->chNBold);
+        g_cfg.numScale = EdI(s->eNScale, 20, 100, g_cfg.numScale);
+        GetWindowTextW(s->eNFg, b, 32);  g_cfg.numFg = ParseColor(b, g_cfg.numFg);
+        GetWindowTextW(s->eNFgH, b, 32); g_cfg.numFgH = ParseColor(b, g_cfg.numFgH);
+        GetWindowTextW(s->eNBg, b, 32);  g_cfg.numBg = ParseColor(b, g_cfg.numBg);
+        GetWindowTextW(s->eNBgH, b, 32); g_cfg.numBgH = ParseColor(b, g_cfg.numBgH);
+        g_cfg.trayNum = Chk(s->chTray);
+        GetWindowTextW(s->eTFont, g_cfg.trayFont, 64); Trim(g_cfg.trayFont);
+        if (!g_cfg.trayFont[0]) cp(g_cfg.trayFont, 64, L"Segoe UI");
+        g_cfg.trayBold = Chk(s->chTBold);
+        GetWindowTextW(s->eTFg, b, 32); g_cfg.trayFg = ParseColor(b, g_cfg.trayFg);
+        GetWindowTextW(s->eTBg, b, 32); g_cfg.trayBg = ParseColor(b, g_cfg.trayBg);
+    }
     { int mi = (int)SendMessageW(s->cbMid, CB_GETCURSEL, 0, 0); if (mi >= 0 && mi <= 6) g_cfg.midItem = mi; }
     if (Chk(s->chAuto) != AutoGet()) AutoSet(Chk(s->chAuto));
     int dbg = Chk(s->chDebug);
@@ -2951,6 +3109,7 @@ static int SetApply(SetDlg *s) {
     memcpy(g_bakn, g_cnt, sizeof g_cnt);
     FlushIconCache();
     ApplyAll();
+    DeskNumChanged();
     TrayUpdate();
     g_lastFg = NULL;
     return 1;
@@ -2993,6 +3152,12 @@ static void SetCmd(Dlg *d, int id, int code) {
     case 504: AddExeToEdit(d->h, s->eRemote); break;
     case 926: PickOvColor(s, d->h, s->eOvCol, g_ov.col); break;
     case 928: PickOvColor(s, d->h, s->eOvOut, g_ov.outc); break;
+    case 965: PickOvColor(s, d->h, s->eNFg, g_cfg.numFg); break;
+    case 967: PickOvColor(s, d->h, s->eNFgH, g_cfg.numFgH); break;
+    case 969: PickOvColor(s, d->h, s->eNBg, g_cfg.numBg); break;
+    case 971: PickOvColor(s, d->h, s->eNBgH, g_cfg.numBgH); break;
+    case 976: PickOvColor(s, d->h, s->eTFg, g_cfg.trayFg); break;
+    case 978: PickOvColor(s, d->h, s->eTBg, g_cfg.trayBg); break;
     case 932: SetApply(s); ShowDeskOverlay(2); break;
     case 903: ShellExecuteW(NULL, L"open", L"notepad.exe", g_ini, NULL, SW_SHOWNORMAL); break;
     case 904:
@@ -3085,6 +3250,7 @@ static void ShowSettings(void) {
     PgMon(&s, s.page[TAB_MON]);
     PgPin(&s, s.page[TAB_PIN]);
     PgDesk(&s, s.page[TAB_DESK]);
+    PgNum(&s, s.page[TAB_NUM]);
     PgExcl(&s, s.page[TAB_EXCL], PW, PH);
     PgGen(&s, s.page[TAB_GEN]);
     g_cur = 0;
@@ -3463,10 +3629,24 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         HDC dc = BeginPaint(h, &ps);
         RECT r;
         GetClientRect(h, &r);
-        HBRUSH br = CreateSolidBrush(g_cfg.color);
+        int numMode = g_cfg.content == 2;
+        HBRUSH br = CreateSolidBrush(numMode ? (b->hover ? g_cfg.numBgH : g_cfg.numBg) : g_cfg.color);
         FillRect(dc, &r, br);
         DeleteObject(br);
-        if (g_icon) DrawIconEx(dc, 0, 0, g_icon, g_cfg.size, g_cfg.size, 0, NULL, DI_NORMAL);
+        if (numMode) {
+            wchar_t t[16];
+            if (g_deskNum > 0) _snwprintf(t, 16, L"%d", g_deskNum); else cp(t, 16, L"?");
+            t[15] = 0;
+            int h2 = g_cfg.size * g_cfg.numScale / 100;
+            if (wcslen(t) > 1) h2 = h2 * 7 / 10;
+            HFONT f = CreateFontW(-h2, 0, 0, 0, g_cfg.numBold ? FW_BOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, g_cfg.numFont);
+            HFONT of = (HFONT)SelectObject(dc, f);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, b->hover ? g_cfg.numFgH : g_cfg.numFg);
+            DrawTextW(dc, t, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(dc, of);
+            DeleteObject(f);
+        } else if (g_icon) DrawIconEx(dc, 0, 0, g_icon, g_cfg.size, g_cfg.size, 0, NULL, DI_NORMAL);
         EndPaint(h, &ps);
         return 0;
     }
@@ -3479,6 +3659,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             TrackMouseEvent(&t);
             b->hover = 1;
             ApplyAlpha(b);
+            if (g_cfg.content == 2) InvalidateRect(h, NULL, FALSE);
         }
         if (b->drag) {
             POINT p;
@@ -3492,6 +3673,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_MOUSELEAVE:
         b->hover = 0;
         ApplyAlpha(b);
+        if (g_cfg.content == 2) InvalidateRect(h, NULL, FALSE);
         return 0;
     case WM_LBUTTONUP:
         if (b->drag) { b->drag = 0; ReleaseCapture(); EndDrag(b); return 0; }
@@ -3652,6 +3834,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
     if (g_nmb == 0) return 1;
     if (g_debug) { DeleteFileW(g_log); LogStartup(); }
     if (fresh) SaveAll();
+    DeskNumChanged();
     if (!TrayAdd() && !g_cfg.show) { /* без значка в трее скрытые кнопки не вернуть */
         g_cfg.show = 1;
         for (int i = 0; i < g_nmb; i++) UpdateVis(g_mb[i]);
