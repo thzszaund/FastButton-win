@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.10.0"
+#define APPVER L"2.11.0"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -75,7 +75,8 @@ static HTREEITEM g_htis[NSEC][MAXE];
 #define g_tree g_trees[g_cur]
 #define g_hti g_htis[g_cur]
 static Act g_click, g_dbl, g_mid;
-static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; int midItem; int content, numBold, numScale, trayNum, trayBold; wchar_t numFont[64], trayFont[64]; COLORREF numFg, numFgH, numBg, numBgH, trayFg, trayBg; } g_cfg; /* content: 0 цвет, 1 иконка, 2 номер стола */
+static Act g_tclick, g_tdbl, g_tmid; /* действия на клики по значку в трее */
+static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; int midItem; int content, numBold, numScale, trayNum, trayBold, trayDup; wchar_t numFont[64], trayFont[64]; COLORREF numFg, numFgH, numBg, numBgH, trayFg, trayBg; } g_cfg; /* content: 0 цвет, 1 иконка, 2 номер стола */
 static wchar_t g_excl[MAXLIST][64], g_remote[MAXLIST][64];
 static int g_nexcl, g_nremote;
 static HICON g_icon;
@@ -96,6 +97,7 @@ static const struct { const wchar_t *id, *label; } BI[] = {
     { L"@taskmgr",  L"Диспетчер задач" },
     { L"@lock",     L"Заблокировать компьютер" },
     { L"@nextdesk", L"Следующий виртуальный рабочий стол (по кругу)" },
+    { L"@toggleshow", L"Показать / скрыть кнопку в углу экрана" },
     { L"@none",     L"Нет действия" },
 };
 #define NBI ((int)WSZ(BI))
@@ -370,6 +372,16 @@ static void SaveActs(void) {
     PutS(L"MiddleClick", L"Action", g_mid.action);
     PutS(L"MiddleClick", L"Args", g_mid.args);
     PutI(L"MiddleClick", L"Hide", g_mid.hide);
+    PutI(L"Options", L"TrayDupActions", g_cfg.trayDup);
+    PutS(L"TrayClick", L"Action", g_tclick.action);
+    PutS(L"TrayClick", L"Args", g_tclick.args);
+    PutI(L"TrayClick", L"Hide", g_tclick.hide);
+    PutS(L"TrayDoubleClick", L"Action", g_tdbl.action);
+    PutS(L"TrayDoubleClick", L"Args", g_tdbl.args);
+    PutI(L"TrayDoubleClick", L"Hide", g_tdbl.hide);
+    PutS(L"TrayMiddleClick", L"Action", g_tmid.action);
+    PutS(L"TrayMiddleClick", L"Args", g_tmid.args);
+    PutI(L"TrayMiddleClick", L"Hide", g_tmid.hide);
 }
 
 static void LoadAll(void) {
@@ -426,6 +438,16 @@ static void LoadAll(void) {
     GetS(L"MiddleClick", L"Action", L"@none", g_mid.action, 520);
     GetS(L"MiddleClick", L"Args", L"", g_mid.args, 260);
     g_mid.hide = GetI(L"MiddleClick", L"Hide", 0) ? 1 : 0;
+    g_cfg.trayDup = GetI(L"Options", L"TrayDupActions", 0) ? 1 : 0;
+    GetS(L"TrayClick", L"Action", L"@toggleshow", g_tclick.action, 520);
+    GetS(L"TrayClick", L"Args", L"", g_tclick.args, 260);
+    g_tclick.hide = GetI(L"TrayClick", L"Hide", 0) ? 1 : 0;
+    GetS(L"TrayDoubleClick", L"Action", L"@none", g_tdbl.action, 520);
+    GetS(L"TrayDoubleClick", L"Args", L"", g_tdbl.args, 260);
+    g_tdbl.hide = GetI(L"TrayDoubleClick", L"Hide", 0) ? 1 : 0;
+    GetS(L"TrayMiddleClick", L"Action", L"@none", g_tmid.action, 520);
+    GetS(L"TrayMiddleClick", L"Args", L"", g_tmid.args, 260);
+    g_tmid.hide = GetI(L"TrayMiddleClick", L"Hide", 0) ? 1 : 0;
 
     if (GetI(L"Button", L"Version", 1) < 2) { /* миграция с v1: "@desktop" теперь значит "все мониторы" */
         if (!wcscmp(g_click.action, L"@desktop")) cp(g_click.action, WSZ(g_click.action), L"@mondesk");
@@ -1085,6 +1107,7 @@ static void PinToggle(HWND w) {
 }
 
 /* ---------- действия ---------- */
+static void ToggleShow(void);
 static int g_runHide; /* 1 = запускать программу/скрипт без окна */
 static void RunSpec(const wchar_t *a, const wchar_t *args, MonBtn *b) {
     if (!a || !*a) return;
@@ -1097,6 +1120,7 @@ static void RunSpec(const wchar_t *a, const wchar_t *args, MonBtn *b) {
         else if (!wcscmp(a, L"@taskmgr")) ShellExecuteW(NULL, L"open", L"taskmgr.exe", NULL, NULL, SW_SHOWNORMAL);
         else if (!wcscmp(a, L"@lock")) LockWorkStation();
         else if (!wcscmp(a, L"@nextdesk")) DeskNext(b);
+        else if (!wcscmp(a, L"@toggleshow")) ToggleShow();
         return;
     }
     wchar_t ex[1100], ea[1100];
@@ -2723,6 +2747,8 @@ typedef struct {
     HWND chPinTop, chPinAll, chRaise, chKeep, chLocal;
     HWND eExcl, eRemote;
     HWND chAuto, chDebug, eEditor, cbMid;
+    Act ta[3];
+    HWND stTAct[3], chTDup;
     HWND cbContent, eNFont, chNBold, eNScale, eNFg, eNFgH, eNBg, eNBgH, chTray, eTFont, chTBold, eTFg, eTBg;
     HWND chOv, chOvBold, eOvFont, eOvSize, eOvOp, eOvCol, eOvOut, eOvOutW, eOvDur, cbOvPos;
 } SetDlg;
@@ -2784,6 +2810,7 @@ static LRESULT CALLBACK PageProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static const wchar_t *const g_tabName[NTABS] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Внешний вид", L"Действия кнопки", L"Мониторы", L"Закрепление окон", L"Рабочие столы", L"Номер стола", L"Исключения", L"Общее" };
+static const wchar_t *const g_tActTitle[3] = { L"Левый клик по значку в трее", L"Двойной левый клик по значку в трее", L"Средняя кнопка по значку в трее" };
 static const wchar_t *const g_actTitle[3] = { L"Левый клик", L"Двойной левый клик", L"Средняя кнопка (колёсико)" };
 static const wchar_t *const g_cornerName[4] = { L"Левый верхний угол", L"Правый верхний угол", L"Левый нижний угол", L"Правый нижний угол" };
 
@@ -2863,15 +2890,36 @@ static void ActText(SetDlg *s, int k) {
     ActDesc(&s->a[k], b, 1200);
     SetWindowTextW(s->stAct[k], b);
 }
+static void ActTextT(SetDlg *s, int k) {
+    wchar_t b[1200];
+    ActDesc(&s->ta[k], b, 1200);
+    SetWindowTextW(s->stTAct[k], b);
+}
+static void TrayDupUi(SetDlg *s) {
+    BOOL own = !Chk(s->chTDup);
+    for (int k = 0; k < 3; k++) { EnableWindow(GetDlgItem(GetParent(s->chTDup), 380 + k), own); EnableWindow(s->stTAct[k], own); }
+}
 static void PgAct(SetDlg *s, HWND pg, int PW) {
     s->a[0] = g_click; s->a[1] = g_dbl; s->a[2] = g_mid;
+    s->ta[0] = g_tclick; s->ta[1] = g_tdbl; s->ta[2] = g_tmid;
     for (int k = 0; k < 3; k++) {
-        int y = 16 + k * 76;
+        int y = 12 + k * 58;
         Lbl(pg, g_actTitle[k], 12, y, 400, 18);
-        s->stAct[k] = Mk(pg, L"STATIC", L"", SS_LEFT, 0, 28, y + 22, PW - 190, 36, -1);
-        Btn(pg, L"Изменить…", PW - 150, y + 20, 130, 28, 301 + k, 0);
+        s->stAct[k] = Mk(pg, L"STATIC", L"", SS_LEFT, 0, 28, y + 20, PW - 190, 32, -1);
+        Btn(pg, L"Изменить…", PW - 150, y + 18, 130, 28, 301 + k, 0);
         ActText(s, k);
     }
+    int y0 = 12 + 3 * 58 + 4;
+    Lbl(pg, L"Значок в трее (правая кнопка открывает меню трея):", 12, y0, 600, 18);
+    s->chTDup = Chkbox(pg, L"Те же действия, что у кнопки в углу экрана (иначе — свои, ниже)", 12, y0 + 22, PW - 30, 385, g_cfg.trayDup);
+    for (int k = 0; k < 3; k++) {
+        int y = y0 + 52 + k * 58;
+        Lbl(pg, g_tActTitle[k], 12, y, 400, 18);
+        s->stTAct[k] = Mk(pg, L"STATIC", L"", SS_LEFT, 0, 28, y + 20, PW - 190, 32, -1);
+        Btn(pg, L"Изменить…", PW - 150, y + 18, 130, 28, 380 + k, 0);
+        ActTextT(s, k);
+    }
+    TrayDupUi(s);
 }
 static void PgMon(SetDlg *s, HWND pg) {
     s->chShow = Chkbox(pg, L"Показывать кнопки в углах экранов (то же, что переключатель в трее)", 12, 12, 700, 311, g_cfg.show);
@@ -3042,6 +3090,8 @@ static int SetApply(SetDlg *s) {
     Trim(g_cfg.icon);
     g_cfg.shape = (int)SendMessageW(s->cbShape, CB_GETCURSEL, 0, 0) == 1 ? 1 : 0;
     g_click = s->a[0]; g_dbl = s->a[1]; g_mid = s->a[2];
+    g_tclick = s->ta[0]; g_tdbl = s->ta[1]; g_tmid = s->ta[2];
+    g_cfg.trayDup = Chk(s->chTDup);
     g_cfg.show = Chk(s->chShow);
     for (int i = 0; i < s->nm && i < g_nmb; i++) {
         MonBtn *q = g_mb[i];
@@ -3142,6 +3192,13 @@ static void SetCmd(Dlg *d, int id, int code) {
         if (BrowseOpen(d->h, L"Иконки (*.ico;*.exe;*.dll)\0*.ico;*.exe;*.dll\0Все файлы\0*.*\0", f, MAX_PATH)) SetWindowTextW(s->eIcon, f);
         break;
     case 209: SetWindowTextW(s->eIcon, L"@app"); break;
+    case 385: TrayDupUi(s); break;
+    case 380: case 381: case 382: {
+        int k = id - 380;
+        wchar_t nm[1] = L"";
+        if (EditActDlg(AM_ACTION, g_tActTitle[k], nm, s->ta[k].action, s->ta[k].args, &s->ta[k].hide, d->h)) ActTextT(s, k);
+        break;
+    }
     case 301: case 302: case 303: {
         int k = id - 301;
         wchar_t nm[1] = L"";
@@ -3726,6 +3783,17 @@ static void CALLBACK FgHook(HWINEVENTHOOK hk, DWORD ev, HWND w, LONG idObj, LONG
     HWND r = GetAncestor(w, GA_ROOT);
     if (r && !IsOurs(r) && !BadClass(r) && IsWindowVisible(r)) g_lastActive = r;
 }
+static int g_trayIgnoreUp;
+static const Act *TrayAct(int k) { /* с галочкой — действия угловой кнопки */
+    if (g_cfg.trayDup) return k == 0 ? &g_click : (k == 1 ? &g_dbl : &g_mid);
+    return k == 0 ? &g_tclick : (k == 1 ? &g_tdbl : &g_tmid);
+}
+static MonBtn *TrayBtn(void) { /* монитор, на котором сейчас курсор */
+    POINT p;
+    GetCursorPos(&p);
+    for (int i = 0; i < g_nmb; i++) if (g_mb[i] && PtInRect(&g_mb[i]->rc, p)) return g_mb[i];
+    return g_nmb ? g_mb[0] : NULL;
+}
 static LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (g_wmTaskbar && m == g_wmTaskbar) { TrayAdd(); return 0; } /* проводник перезапущен */
     if ((g_cm2 || g_cm3) && (m == WM_INITMENUPOPUP || m == WM_DRAWITEM || m == WM_MEASUREITEM || m == WM_MENUCHAR)) {
@@ -3736,7 +3804,16 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_TRAY:
         if (g_modal) return 0;
-        if (l == WM_LBUTTONUP) ToggleShow();
+        if (l == WM_LBUTTONUP) {
+            if (g_trayIgnoreUp) { g_trayIgnoreUp = 0; return 0; }
+            const Act *dbl = TrayAct(1);
+            if (!dbl->action[0] || !wcscmp(dbl->action, L"@none")) RunAct(TrayAct(0), TrayBtn());
+            else SetTimer(h, 11, GetDoubleClickTime(), NULL);
+        } else if (l == WM_LBUTTONDBLCLK) {
+            KillTimer(h, 11);
+            g_trayIgnoreUp = 1;
+            RunAct(TrayAct(1), TrayBtn());
+        } else if (l == WM_MBUTTONUP) RunAct(TrayAct(2), TrayBtn());
         else if (l == WM_RBUTTONUP || l == WM_CONTEXTMENU) ShowTrayMenu();
         return 0;
     case WM_MENUSELECT: OnMenuSelect(w, l); return 0;
@@ -3745,6 +3822,7 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DISPLAYCHANGE: SetTimer(h, 9, 700, NULL); return 0;
     case WM_TIMER:
         if (w == 9) { KillTimer(h, 9); SyncMonitors(); }
+        else if (w == 11) { KillTimer(h, 11); RunAct(TrayAct(0), TrayBtn()); }
         else if (w == 2) Reassert();
         else if (w == 3) { UpdateExclusion(); CheckDesktopSwitch(); }
         return 0;
