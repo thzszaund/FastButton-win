@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.8.3"
+#define APPVER L"2.9.0"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -38,7 +38,7 @@ enum { SEC_PROG = 0, SEC_SCRIPT = 1, SEC_FOLDER = 2, SEC_FILES = 3 };
 #define WSZ(a) (sizeof(a) / sizeof((a)[0]))
 
 /* ---------- данные ---------- */
-typedef struct { wchar_t action[520]; wchar_t args[260]; } Act;
+typedef struct { wchar_t action[520]; wchar_t args[260]; int hide; } Act; /* hide: запускать без окна */
 typedef struct { int depth, type, flags; wchar_t name[128], action[520], args[260], icon[260], note[300], interp[260]; } Entry; /* type: 0 пункт, 1 категория, 2 разделитель; flags: 1 админ, 2 скрытое окно */
 
 typedef struct MonBtn {
@@ -362,10 +362,13 @@ static int LoadSections(void) { /* 1, если нужно сохранить (п
 static void SaveActs(void) {
     PutS(L"Click", L"Action", g_click.action);
     PutS(L"Click", L"Args", g_click.args);
+    PutI(L"Click", L"Hide", g_click.hide);
     PutS(L"DoubleClick", L"Action", g_dbl.action);
     PutS(L"DoubleClick", L"Args", g_dbl.args);
+    PutI(L"DoubleClick", L"Hide", g_dbl.hide);
     PutS(L"MiddleClick", L"Action", g_mid.action);
     PutS(L"MiddleClick", L"Args", g_mid.args);
+    PutI(L"MiddleClick", L"Hide", g_mid.hide);
 }
 
 static void LoadAll(void) {
@@ -402,10 +405,13 @@ static void LoadAll(void) {
 
     GetS(L"Click", L"Action", L"@mondesk", g_click.action, 520);
     GetS(L"Click", L"Args", L"", g_click.args, 260);
+    g_click.hide = GetI(L"Click", L"Hide", 0) ? 1 : 0;
     GetS(L"DoubleClick", L"Action", L"@taskview", g_dbl.action, 520);
     GetS(L"DoubleClick", L"Args", L"", g_dbl.args, 260);
+    g_dbl.hide = GetI(L"DoubleClick", L"Hide", 0) ? 1 : 0;
     GetS(L"MiddleClick", L"Action", L"@none", g_mid.action, 520);
     GetS(L"MiddleClick", L"Args", L"", g_mid.args, 260);
+    g_mid.hide = GetI(L"MiddleClick", L"Hide", 0) ? 1 : 0;
 
     if (GetI(L"Button", L"Version", 1) < 2) { /* миграция с v1: "@desktop" теперь значит "все мониторы" */
         if (!wcscmp(g_click.action, L"@desktop")) cp(g_click.action, WSZ(g_click.action), L"@mondesk");
@@ -1048,6 +1054,7 @@ static void PinToggle(HWND w) {
 }
 
 /* ---------- действия ---------- */
+static int g_runHide; /* 1 = запускать программу/скрипт без окна */
 static void RunSpec(const wchar_t *a, const wchar_t *args, MonBtn *b) {
     if (!a || !*a) return;
     if (a[0] == L'@') {
@@ -1065,7 +1072,15 @@ static void RunSpec(const wchar_t *a, const wchar_t *args, MonBtn *b) {
     ExpandEnvironmentStringsW(a, ex, 1100);
     ea[0] = 0;
     if (args && *args) ExpandEnvironmentStringsW(args, ea, 1100);
-    HINSTANCE r = ShellExecuteW(NULL, L"open", ex, ea[0] ? ea : NULL, g_dir, SW_SHOWNORMAL);
+    int sw = g_runHide ? SW_HIDE : SW_SHOWNORMAL;
+    const wchar_t *dot = wcsrchr(ex, L'.');
+    HINSTANCE r;
+    if (dot && !_wcsicmp(dot, L".ps1")) { /* PowerShell-скрипт: по умолчанию «открывается» в блокноте, поэтому запускаем явно */
+        wchar_t pp[2400];
+        _snwprintf(pp, 2400, L"-NoProfile -ExecutionPolicy Bypass -File \"%ls\" %ls", ex, ea);
+        pp[2399] = 0;
+        r = ShellExecuteW(NULL, L"open", L"powershell.exe", pp, g_dir, sw);
+    } else r = ShellExecuteW(NULL, L"open", ex, ea[0] ? ea : NULL, g_dir, sw);
     if ((INT_PTR)r <= 32) {
         wchar_t msg[1300];
         _snwprintf(msg, 1300, L"Не удалось запустить:\n%ls", ex);
@@ -1073,7 +1088,7 @@ static void RunSpec(const wchar_t *a, const wchar_t *args, MonBtn *b) {
         MessageBoxW(NULL, msg, APPNAME, MB_ICONWARNING);
     }
 }
-static void RunAct(const Act *a, MonBtn *b) { RunSpec(a->action, a->args, b); }
+static void RunAct(const Act *a, MonBtn *b) { g_runHide = a->hide; RunSpec(a->action, a->args, b); g_runHide = 0; }
 
 /* ---------- кнопки на мониторах ---------- */
 static void LoadIconCfg(void) {
@@ -1666,12 +1681,15 @@ static int RunModal(Dlg *d, HWND owner) {
 
 /* --- диалог действия / пункта / папки --- */
 enum { AM_ACTION = 0, AM_ITEM = 1, AM_FOLDER = 2 };
-typedef struct { Dlg d; int mode; wchar_t name[128], action[520], args[260]; HWND eName, cb, ePath, eArgs; } ActDlg;
+static int Chk(HWND h);
+static HWND Chkbox(HWND p, const wchar_t *t, int x, int y, int w, int id, int on);
+typedef struct { Dlg d; int mode; wchar_t name[128], action[520], args[260]; int hide; HWND eName, cb, ePath, eArgs, chHide; } ActDlg;
 
 static void ActEnable(ActDlg *a) {
     BOOL open = (int)SendMessageW(a->cb, CB_GETCURSEL, 0, 0) == NBI;
     EnableWindow(a->ePath, open);
     EnableWindow(a->eArgs, open);
+    if (a->chHide) EnableWindow(a->chHide, open);
     EnableWindow(GetDlgItem(a->d.h, 305), open);
     EnableWindow(GetDlgItem(a->d.h, 306), open);
 }
@@ -1687,7 +1705,7 @@ static void ActCmd(Dlg *d, int id, int code) {
         memset(&o, 0, sizeof o);
         o.lStructSize = sizeof o;
         o.hwndOwner = d->h;
-        o.lpstrFilter = L"Все файлы\0*.*\0";
+        o.lpstrFilter = L"Программы и скрипты\0*.exe;*.com;*.bat;*.cmd;*.vbs;*.vbe;*.js;*.jse;*.wsf;*.ps1;*.py;*.lnk\0Все файлы\0*.*\0";
         o.lpstrFile = f;
         o.nMaxFile = MAX_PATH;
         o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
@@ -1720,6 +1738,7 @@ static void ActCmd(Dlg *d, int id, int code) {
                 GetWindowTextW(a->ePath, a->action, 520);
                 Trim(a->action);
                 GetWindowTextW(a->eArgs, a->args, 260);
+                a->hide = a->chHide ? Chk(a->chHide) : 0;
                 if (!a->action[0]) { MessageBoxW(d->h, L"Введите путь, ссылку или программу.", APPNAME, MB_ICONINFORMATION); return; }
             }
         }
@@ -1730,11 +1749,11 @@ static void ActCmd(Dlg *d, int id, int code) {
     }
 }
 /* возвращает 1 если OK; значения записываются в name/action/args только при OK */
-static int EditActDlg(int mode, const wchar_t *title, wchar_t *name, wchar_t *action, wchar_t *args, HWND owner) {
+static int EditActDlg(int mode, const wchar_t *title, wchar_t *name, wchar_t *action, wchar_t *args, int *hide, HWND owner) {
     ActDlg a;
     memset(&a, 0, sizeof a);
     a.mode = mode;
-    NewDlg(&a.d, title, 480, mode == AM_FOLDER ? 108 : (mode == AM_ITEM ? 276 : 220));
+    NewDlg(&a.d, title, 480, mode == AM_FOLDER ? 108 : (mode == AM_ITEM ? 276 : 252));
     a.d.oncmd = ActCmd;
     HWND h = a.d.h;
     int y = 12;
@@ -1762,6 +1781,10 @@ static int EditActDlg(int mode, const wchar_t *title, wchar_t *name, wchar_t *ac
         y += 20;
         a.eArgs = Edt(h, 12, y, 456, 24, 304);
         y += 36;
+        if (mode == AM_ACTION && hide) {
+            a.chHide = Chkbox(h, L"Запускать без окна (скрыто; удобно для .bat/.vbs)", 12, y, 456, 307, *hide);
+            y += 32;
+        }
         int sel = NBI;
         for (int i = 0; i < NBI; i++) if (!wcscmp(action, BI[i].id)) sel = i;
         SendMessageW(a.cb, CB_SETCURSEL, sel, 0);
@@ -1772,7 +1795,7 @@ static int EditActDlg(int mode, const wchar_t *title, wchar_t *name, wchar_t *ac
     Btn(h, L"Отмена", 383, y, 85, 28, IDCANCEL, 0);
     if (!RunModal(&a.d, owner)) return 0;
     if (mode != AM_ACTION) cp(name, 128, a.name);
-    if (mode != AM_FOLDER) { cp(action, 520, a.action); cp(args, 260, a.args); }
+    if (mode != AM_FOLDER) { cp(action, 520, a.action); cp(args, 260, a.args); if (hide) *hide = a.hide; }
     return 1;
 }
 
@@ -2614,8 +2637,8 @@ static int g_bakn[NSEC];
 static void ActDesc(const Act *a, wchar_t *out, int n) {
     for (int i = 0; i < NBI; i++) if (!wcscmp(a->action, BI[i].id)) { cp(out, (size_t)n, BI[i].label); return; }
     if (!a->action[0]) { cp(out, (size_t)n, L"(нет действия)"); return; }
-    if (a->args[0]) _snwprintf(out, (size_t)n, L"Открыть: %ls  %ls", a->action, a->args);
-    else _snwprintf(out, (size_t)n, L"Открыть: %ls", a->action);
+    if (a->args[0]) _snwprintf(out, (size_t)n, L"Открыть: %ls  %ls%ls", a->action, a->args, a->hide ? L"  (скрыто)" : L"");
+    else _snwprintf(out, (size_t)n, L"Открыть: %ls%ls", a->action, a->hide ? L"  (скрыто)" : L"");
     out[n - 1] = 0;
 }
 static void LinesToEdit(HWND ed, wchar_t (*arr)[64], int n) {
@@ -2963,7 +2986,7 @@ static void SetCmd(Dlg *d, int id, int code) {
     case 301: case 302: case 303: {
         int k = id - 301;
         wchar_t nm[1] = L"";
-        if (EditActDlg(AM_ACTION, g_actTitle[k], nm, s->a[k].action, s->a[k].args, d->h)) ActText(s, k);
+        if (EditActDlg(AM_ACTION, g_actTitle[k], nm, s->a[k].action, s->a[k].args, &s->a[k].hide, d->h)) ActText(s, k);
         break;
     }
     case 502: AddExeToEdit(d->h, s->eExcl); break;
