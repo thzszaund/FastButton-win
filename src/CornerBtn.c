@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.7.0"
+#define APPVER L"2.8.0"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -60,6 +60,7 @@ static HFONT g_font;
 static int g_dpi = 96;
 static wchar_t g_ini[MAX_PATH], g_dir[MAX_PATH];
 static COLORREF g_cust[16];
+static struct { int show, size, opacity, pos, dur, outw, bold; COLORREF col, outc; wchar_t font[64]; } g_ov; /* оверлей с номером рабочего стола */
 
 static MonBtn *g_mb[MAXMON];
 static int g_nmb;
@@ -93,6 +94,7 @@ static const struct { const wchar_t *id, *label; } BI[] = {
     { L"@pin",      L"Закрепить / открепить активное окно" },
     { L"@taskmgr",  L"Диспетчер задач" },
     { L"@lock",     L"Заблокировать компьютер" },
+    { L"@nextdesk", L"Следующий виртуальный рабочий стол (по кругу)" },
     { L"@none",     L"Нет действия" },
 };
 #define NBI ((int)WSZ(BI))
@@ -380,6 +382,18 @@ static void LoadAll(void) {
     g_cfg.raisePinned = GetI(L"Options", L"RaisePinned", 1) ? 1 : 0;
     g_cfg.show = GetI(L"Options", L"ShowButtons", 1) ? 1 : 0;
     GetS(L"Options", L"TextEditor", L"", g_cfg.editor, MAX_PATH * 2);
+    g_ov.show = GetI(L"DeskOverlay", L"Show", 1) ? 1 : 0;
+    GetS(L"DeskOverlay", L"Font", L"Segoe UI", g_ov.font, 64);
+    g_ov.size = Clamp(GetI(L"DeskOverlay", L"Size", 120), 20, 600);
+    g_ov.bold = GetI(L"DeskOverlay", L"Bold", 1) ? 1 : 0;
+    g_ov.opacity = Clamp(GetI(L"DeskOverlay", L"Opacity", 75), 5, 100);
+    g_ov.pos = Clamp(GetI(L"DeskOverlay", L"Position", 4), 0, 8);
+    g_ov.dur = Clamp(GetI(L"DeskOverlay", L"DurationMs", 900), 200, 5000);
+    g_ov.outw = Clamp(GetI(L"DeskOverlay", L"OutlineWidth", 6), 0, 40);
+    GetS(L"DeskOverlay", L"Color", L"FFFFFF", b, 64);
+    g_ov.col = ParseColor(b, RGB(255, 255, 255));
+    GetS(L"DeskOverlay", L"OutlineColor", L"000000", b, 64);
+    g_ov.outc = ParseColor(b, RGB(0, 0, 0));
     g_cfg.midItem = Clamp(GetI(L"Options", L"MenuMiddleClick", 1), 0, 6);
     g_debug = GetI(L"Options", L"Debug", 0) ? 1 : 0;
     GetS(L"Button", L"Color", L"3399FF", b, 64);
@@ -429,6 +443,18 @@ static void SaveCfg(void) {
     PutI(L"Options", L"ShowButtons", g_cfg.show);
     PutS(L"Options", L"TextEditor", g_cfg.editor);
     PutI(L"Options", L"MenuMiddleClick", g_cfg.midItem);
+    PutI(L"DeskOverlay", L"Show", g_ov.show);
+    PutS(L"DeskOverlay", L"Font", g_ov.font);
+    PutI(L"DeskOverlay", L"Size", g_ov.size);
+    PutI(L"DeskOverlay", L"Bold", g_ov.bold);
+    PutI(L"DeskOverlay", L"Opacity", g_ov.opacity);
+    PutI(L"DeskOverlay", L"Position", g_ov.pos);
+    PutI(L"DeskOverlay", L"DurationMs", g_ov.dur);
+    PutI(L"DeskOverlay", L"OutlineWidth", g_ov.outw);
+    _snwprintf(b, 32, L"%02X%02X%02X", GetRValue(g_ov.col), GetGValue(g_ov.col), GetBValue(g_ov.col)); b[31] = 0;
+    PutS(L"DeskOverlay", L"Color", b);
+    _snwprintf(b, 32, L"%02X%02X%02X", GetRValue(g_ov.outc), GetGValue(g_ov.outc), GetBValue(g_ov.outc)); b[31] = 0;
+    PutS(L"DeskOverlay", L"OutlineColor", b);
 }
 /* ---------- настройки мониторов ---------- */
 static void MonKey(const wchar_t *dev, wchar_t *out) {
@@ -626,8 +652,143 @@ static int ReadCurDesk(GUID *g) {
     }
     return 0;
 }
+
+/* ---------- переключение виртуальных столов по кругу + оверлей с номером ---------- */
+static void LocalizeFocus(MonBtn *b);
+static int g_ovTick, g_ovNum;
+static HWND g_ovWnd;
+static int DeskInfo(int *idx) { /* число столов и индекс текущего (из реестра); idx=-1 если не определён */
+    BYTE ids[16 * 64];
+    int n = 0;
+    *idx = -1;
+    for (int pass = 0; pass < 2 && !n; pass++) {
+        wchar_t path[260];
+        DWORD sid = 0;
+        ProcessIdToSessionId(GetCurrentProcessId(), &sid);
+        if (pass == 0) cp(path, 260, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops");
+        else _snwprintf(path, 260, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo\\%lu\\VirtualDesktops", (unsigned long)sid);
+        path[259] = 0;
+        HKEY k;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+            DWORD sz = sizeof ids;
+            if (RegQueryValueExW(k, L"VirtualDesktopIDs", NULL, NULL, ids, &sz) == ERROR_SUCCESS && sz >= 16) n = (int)(sz / 16);
+            RegCloseKey(k);
+        }
+    }
+    if (n < 1) return 0;
+    GUID cur;
+    if (ReadCurDesk(&cur))
+        for (int i = 0; i < n; i++) if (!memcmp(ids + i * 16, &cur, 16)) { *idx = i; break; }
+    return n;
+}
+static LRESULT CALLBACK OvProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_TIMER: KillTimer(h, 1); ShowWindow(h, SW_HIDE); return 0;
+    case WM_NCHITTEST: return HTTRANSPARENT;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        COLORREF key = RGB(255, 0, 254);
+        HBRUSH kb = CreateSolidBrush(key);
+        FillRect(dc, &rc, kb);
+        DeleteObject(kb);
+        wchar_t t[16];
+        _snwprintf(t, 16, L"%d", g_ovNum);
+        t[15] = 0;
+        HFONT f = CreateFontW(-S(g_ov.size), 0, 0, 0, g_ov.bold ? FW_BOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, g_ov.font);
+        HFONT of = (HFONT)SelectObject(dc, f);
+        SetBkMode(dc, TRANSPARENT);
+        int pad = S(g_ov.outw) + S(6);
+        if (g_ov.outw > 0) {
+            LOGBRUSH lb;
+            lb.lbStyle = BS_SOLID; lb.lbColor = g_ov.outc; lb.lbHatch = 0;
+            HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_JOIN_ROUND | PS_ENDCAP_ROUND, S(g_ov.outw) * 2, &lb, 0, NULL);
+            HPEN op = (HPEN)SelectObject(dc, pen);
+            BeginPath(dc); TextOutW(dc, pad, pad, t, (int)wcslen(t)); EndPath(dc);
+            StrokePath(dc);
+            SelectObject(dc, op);
+            DeleteObject(pen);
+        }
+        HBRUSH fb = CreateSolidBrush(g_ov.col);
+        HBRUSH ob = (HBRUSH)SelectObject(dc, fb);
+        BeginPath(dc); TextOutW(dc, pad, pad, t, (int)wcslen(t)); EndPath(dc);
+        FillPath(dc);
+        SelectObject(dc, ob);
+        DeleteObject(fb);
+        SelectObject(dc, of);
+        DeleteObject(f);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void ShowDeskOverlay(int num) { /* num <= 0: показать номер текущего стола */
+    if (num <= 0) {
+        int idx;
+        if (DeskInfo(&idx) < 1 || idx < 0) return;
+        num = idx + 1;
+    }
+    g_ovNum = num;
+    if (!g_ovWnd) {
+        g_ovWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, L"CBOverlay", L"", WS_POPUP, 0, 0, 10, 10, NULL, NULL, g_hinst, NULL);
+        if (!g_ovWnd) return;
+    }
+    wchar_t t[16];
+    _snwprintf(t, 16, L"%d", num);
+    t[15] = 0;
+    HDC dc = GetDC(NULL);
+    HFONT f = CreateFontW(-S(g_ov.size), 0, 0, 0, g_ov.bold ? FW_BOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, g_ov.font);
+    HFONT of = (HFONT)SelectObject(dc, f);
+    SIZE sz;
+    GetTextExtentPoint32W(dc, t, (int)wcslen(t), &sz);
+    SelectObject(dc, of);
+    DeleteObject(f);
+    ReleaseDC(NULL, dc);
+    int pad = S(g_ov.outw) + S(6);
+    int w = sz.cx + 2 * pad, h = sz.cy + 2 * pad;
+    POINT pt;
+    GetCursorPos(&pt);
+    MONITORINFO mi;
+    mi.cbSize = sizeof mi;
+    GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT r = mi.rcMonitor;
+    int mx = (r.right - r.left) / 30, my = (r.bottom - r.top) / 30;
+    int col = g_ov.pos % 3, row = g_ov.pos / 3;
+    int x = col == 0 ? r.left + mx : (col == 1 ? (r.left + r.right - w) / 2 : r.right - w - mx);
+    int y = row == 0 ? r.top + my : (row == 1 ? (r.top + r.bottom - h) / 2 : r.bottom - h - my);
+    SetLayeredWindowAttributes(g_ovWnd, RGB(255, 0, 254), (BYTE)(g_ov.opacity * 255 / 100), LWA_COLORKEY | LWA_ALPHA);
+    SetWindowPos(g_ovWnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_ovWnd, NULL, TRUE);
+    UpdateWindow(g_ovWnd);
+    SetTimer(g_ovWnd, 1, (UINT)g_ov.dur, NULL);
+}
+static void DeskNext(MonBtn *b) { /* следующий стол; с последнего возвращаемся на первый */
+    int idx, n = DeskInfo(&idx);
+    if (n < 2) { Log(L"@nextdesk: столов меньше двух (n=%d)", n); if (g_ov.show) ShowDeskOverlay(1); return; }
+    int cnt = (idx >= 0 && idx == n - 1) ? n - 1 : 1;
+    WORD vk = (cnt == 1) ? VK_RIGHT : VK_LEFT;
+    LocalizeFocus(b);
+    INPUT in[2 + 2 * 64 + 2];
+    int k = 0;
+    ZeroMemory(in, sizeof in);
+    in[k].type = INPUT_KEYBOARD; in[k++].ki.wVk = VK_LWIN;
+    in[k].type = INPUT_KEYBOARD; in[k++].ki.wVk = VK_LCONTROL;
+    for (int i = 0; i < cnt && k < 2 + 2 * 64; i++) {
+        in[k].type = INPUT_KEYBOARD; in[k].ki.wVk = vk; in[k++].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+        in[k].type = INPUT_KEYBOARD; in[k].ki.wVk = vk; in[k++].ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP;
+    }
+    in[k].type = INPUT_KEYBOARD; in[k].ki.wVk = VK_LCONTROL; in[k++].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[k].type = INPUT_KEYBOARD; in[k].ki.wVk = VK_LWIN; in[k++].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput((UINT)k, in, sizeof(INPUT));
+    Log(L"@nextdesk: стол %d из %d, шагов %ls x%d", idx + 1, n, vk == VK_RIGHT ? L"вправо" : L"влево", cnt);
+}
 static void CheckDesktopSwitch(void) {
     if (g_inMenu || g_modal) return;
+    if (g_ovTick > 0 && --g_ovTick == 0 && g_ov.show) ShowDeskOverlay(0);
     GUID cur;
     int src = ReadCurDesk(&cur);
     if (src) {
@@ -637,6 +798,7 @@ static void CheckDesktopSwitch(void) {
             Log(L"смена виртуального стола (реестр)");
             if (g_debug) { HWND fg = GetForegroundWindow(); wchar_t dd[700]; if (fg) { DescWin(fg, dd, 700); Log(L"  активное окно сейчас: %ls", dd); } }
             g_raiseTicks = 5;
+            g_ovTick = 1;
         }
     } else if (g_vdm && g_npinned) { /* запасной способ: по активному окну */
         HWND fg = GetForegroundWindow();
@@ -892,6 +1054,7 @@ static void RunSpec(const wchar_t *a, const wchar_t *args, MonBtn *b) {
         else if (!wcscmp(a, L"@pin")) PinToggle(FgTarget());
         else if (!wcscmp(a, L"@taskmgr")) ShellExecuteW(NULL, L"open", L"taskmgr.exe", NULL, NULL, SW_SHOWNORMAL);
         else if (!wcscmp(a, L"@lock")) LockWorkStation();
+        else if (!wcscmp(a, L"@nextdesk")) DeskNext(b);
         return;
     }
     wchar_t ex[1100], ea[1100];
@@ -2426,7 +2589,7 @@ static LRESULT CALLBACK TreeSub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id,
 }
 
 /* ---------- окно настроек со вкладками ---------- */
-enum { TAB_PROG = 0, TAB_SCRIPT, TAB_FOLDER, TAB_FILES, TAB_APP, TAB_ACT, TAB_MON, TAB_PIN, TAB_EXCL, TAB_GEN, NTABS };
+enum { TAB_PROG = 0, TAB_SCRIPT, TAB_FOLDER, TAB_FILES, TAB_APP, TAB_ACT, TAB_MON, TAB_PIN, TAB_DESK, TAB_EXCL, TAB_GEN, NTABS };
 typedef struct {
     Dlg d;
     HWND tab, page[NTABS];
@@ -2439,6 +2602,7 @@ typedef struct {
     HWND chPinTop, chPinAll, chRaise, chKeep, chLocal;
     HWND eExcl, eRemote;
     HWND chAuto, chDebug, eEditor, cbMid;
+    HWND chOv, chOvBold, eOvFont, eOvSize, eOvOp, eOvCol, eOvOut, eOvOutW, eOvDur, cbOvPos;
 } SetDlg;
 static Entry g_bak[NSEC][MAXE];
 static int g_bakn[NSEC];
@@ -2497,7 +2661,7 @@ static LRESULT CALLBACK PageProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-static const wchar_t *const g_tabName[NTABS] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Внешний вид", L"Действия кнопки", L"Мониторы", L"Закрепление окон", L"Исключения", L"Общее" };
+static const wchar_t *const g_tabName[NTABS] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Внешний вид", L"Действия кнопки", L"Мониторы", L"Закрепление окон", L"Рабочие столы", L"Исключения", L"Общее" };
 static const wchar_t *const g_actTitle[3] = { L"Левый клик", L"Двойной левый клик", L"Средняя кнопка (колёсико)" };
 static const wchar_t *const g_cornerName[4] = { L"Левый верхний угол", L"Правый верхний угол", L"Левый нижний угол", L"Правый нижний угол" };
 
@@ -2607,6 +2771,61 @@ static void PgPin(SetDlg *s, HWND pg) {
     s->chKeep = Chkbox(pg, L"Не сворачивать кнопкой окна «поверх всех»", 12, 118, 740, 404, g_cfg.keepTop);
     s->chLocal = Chkbox(pg, L"Выполнять клавиатурные действия на этом компьютере, если активен RDP/VNC (список программ — на вкладке «Исключения»)", 12, 152, 740, 405, g_cfg.localKeys);
 }
+static void PgDesk(SetDlg *s, HWND pg) {
+    wchar_t b[64];
+    s->chOv = Chkbox(pg, L"Показывать номер рабочего стола при его смене (в том числе после Win+Ctrl+←/→)", 12, 16, 760, 920, g_ov.show);
+    Lbl(pg, L"Шрифт:", 12, 58, 150, 24);
+    s->eOvFont = Edt(pg, 170, 54, 240, 24, 921);
+    SetWindowTextW(s->eOvFont, g_ov.font);
+    s->chOvBold = Chkbox(pg, L"Жирный", 430, 56, 120, 922, g_ov.bold);
+    Lbl(pg, L"Размер (px):", 12, 92, 150, 24);
+    s->eOvSize = Edt(pg, 170, 88, 80, 24, 923);
+    _snwprintf(b, 64, L"%d", g_ov.size); SetWindowTextW(s->eOvSize, b);
+    Lbl(pg, L"Прозрачность, % (100 — непрозрачно):", 12, 126, 300, 24);
+    s->eOvOp = Edt(pg, 320, 122, 80, 24, 924);
+    _snwprintf(b, 64, L"%d", g_ov.opacity); SetWindowTextW(s->eOvOp, b);
+    Lbl(pg, L"Цвет цифры (RRGGBB):", 12, 160, 200, 24);
+    s->eOvCol = Edt(pg, 220, 156, 100, 24, 925);
+    _snwprintf(b, 64, L"%02X%02X%02X", GetRValue(g_ov.col), GetGValue(g_ov.col), GetBValue(g_ov.col)); SetWindowTextW(s->eOvCol, b);
+    Btn(pg, L"Выбрать…", 330, 156, 110, 24, 926, 0);
+    Lbl(pg, L"Цвет обводки (RRGGBB):", 12, 194, 200, 24);
+    s->eOvOut = Edt(pg, 220, 190, 100, 24, 927);
+    _snwprintf(b, 64, L"%02X%02X%02X", GetRValue(g_ov.outc), GetGValue(g_ov.outc), GetBValue(g_ov.outc)); SetWindowTextW(s->eOvOut, b);
+    Btn(pg, L"Выбрать…", 330, 190, 110, 24, 928, 0);
+    Lbl(pg, L"Толщина обводки, px (0 — без обводки):", 12, 228, 320, 24);
+    s->eOvOutW = Edt(pg, 340, 224, 80, 24, 929);
+    _snwprintf(b, 64, L"%d", g_ov.outw); SetWindowTextW(s->eOvOutW, b);
+    Lbl(pg, L"Время показа, мс:", 12, 262, 200, 24);
+    s->eOvDur = Edt(pg, 220, 258, 80, 24, 930);
+    _snwprintf(b, 64, L"%d", g_ov.dur); SetWindowTextW(s->eOvDur, b);
+    Lbl(pg, L"Положение на экране (монитор с курсором):", 12, 296, 340, 24);
+    s->cbOvPos = Mk(pg, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, 360, 292, 240, 240, 931);
+    {
+        static const wchar_t *po[] = { L"Слева сверху", L"По центру сверху", L"Справа сверху", L"Слева по центру", L"По центру экрана", L"Справа по центру", L"Слева снизу", L"По центру снизу", L"Справа снизу" };
+        for (int i = 0; i < 9; i++) SendMessageW(s->cbOvPos, CB_ADDSTRING, 0, (LPARAM)po[i]);
+        SendMessageW(s->cbOvPos, CB_SETCURSEL, g_ov.pos, 0);
+    }
+    Btn(pg, L"Применить и показать пример", 12, 340, 520, 30, 932, 0);
+    Lbl(pg, L"Действие «Следующий виртуальный рабочий стол (по кругу)» можно назначить на любую кнопку/жест на вкладке «Действия кнопки».", 12, 384, 760, 40);
+}
+static void PickOvColor(SetDlg *s, HWND owner, HWND ed, COLORREF def) {
+    wchar_t b[32];
+    (void)s;
+    GetWindowTextW(ed, b, 32);
+    CHOOSECOLORW cc;
+    memset(&cc, 0, sizeof cc);
+    cc.lStructSize = sizeof cc;
+    cc.hwndOwner = owner;
+    cc.rgbResult = ParseColor(b, def);
+    cc.lpCustColors = g_cust;
+    cc.Flags = CC_RGBINIT | CC_FULLOPEN;
+    if (ChooseColorW(&cc)) {
+        _snwprintf(b, 32, L"%02X%02X%02X", GetRValue(cc.rgbResult), GetGValue(cc.rgbResult), GetBValue(cc.rgbResult));
+        b[31] = 0;
+        SetWindowTextW(ed, b);
+    }
+}
+static int EdI(HWND e, int lo, int hi, int def) { wchar_t b[32]; GetWindowTextW(e, b, 32); wchar_t *p; long v = wcstol(b, &p, 10); return (p == b) ? def : Clamp((int)v, lo, hi); }
 static void PgExcl(SetDlg *s, HWND pg, int PW, int PH) {
     int eh = (PH - 190) / 2;
     if (eh < 60) eh = 60;
@@ -2676,6 +2895,22 @@ static int SetApply(SetDlg *s) {
     EditToLines(s->eRemote, g_remote, &g_nremote);
     GetWindowTextW(s->eEditor, g_cfg.editor, MAX_PATH * 2);
     Trim(g_cfg.editor);
+    {
+        wchar_t b[64];
+        g_ov.show = Chk(s->chOv);
+        GetWindowTextW(s->eOvFont, g_ov.font, 64);
+        Trim(g_ov.font);
+        if (!g_ov.font[0]) cp(g_ov.font, 64, L"Segoe UI");
+        g_ov.bold = Chk(s->chOvBold);
+        g_ov.size = EdI(s->eOvSize, 20, 600, g_ov.size);
+        g_ov.opacity = EdI(s->eOvOp, 5, 100, g_ov.opacity);
+        g_ov.outw = EdI(s->eOvOutW, 0, 40, g_ov.outw);
+        g_ov.dur = EdI(s->eOvDur, 200, 5000, g_ov.dur);
+        GetWindowTextW(s->eOvCol, b, 32); g_ov.col = ParseColor(b, g_ov.col);
+        GetWindowTextW(s->eOvOut, b, 32); g_ov.outc = ParseColor(b, g_ov.outc);
+        int pp = (int)SendMessageW(s->cbOvPos, CB_GETCURSEL, 0, 0);
+        if (pp >= 0 && pp <= 8) g_ov.pos = pp;
+    }
     { int mi = (int)SendMessageW(s->cbMid, CB_GETCURSEL, 0, 0); if (mi >= 0 && mi <= 6) g_cfg.midItem = mi; }
     if (Chk(s->chAuto) != AutoGet()) AutoSet(Chk(s->chAuto));
     int dbg = Chk(s->chDebug);
@@ -2729,6 +2964,9 @@ static void SetCmd(Dlg *d, int id, int code) {
     }
     case 502: AddExeToEdit(d->h, s->eExcl); break;
     case 504: AddExeToEdit(d->h, s->eRemote); break;
+    case 926: PickOvColor(s, d->h, s->eOvCol, g_ov.col); break;
+    case 928: PickOvColor(s, d->h, s->eOvOut, g_ov.outc); break;
+    case 932: SetApply(s); ShowDeskOverlay(2); break;
     case 903: ShellExecuteW(NULL, L"open", L"notepad.exe", g_ini, NULL, SW_SHOWNORMAL); break;
     case 904:
         LoadAll();
@@ -2819,6 +3057,7 @@ static void ShowSettings(void) {
     PgAct(&s, s.page[TAB_ACT], PW);
     PgMon(&s, s.page[TAB_MON]);
     PgPin(&s, s.page[TAB_PIN]);
+    PgDesk(&s, s.page[TAB_DESK]);
     PgExcl(&s, s.page[TAB_EXCL], PW, PH);
     PgGen(&s, s.page[TAB_GEN]);
     g_cur = 0;
@@ -3346,6 +3585,12 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
     wc.hInstance = hi;
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.lpszClassName = L"CBBtn";
+    RegisterClassExW(&wc);
+    memset(&wc, 0, sizeof wc);
+    wc.cbSize = sizeof wc;
+    wc.lpfnWndProc = OvProc;
+    wc.hInstance = hi;
+    wc.lpszClassName = L"CBOverlay";
     RegisterClassExW(&wc);
     memset(&wc, 0, sizeof wc);
     wc.cbSize = sizeof wc;
