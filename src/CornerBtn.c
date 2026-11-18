@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.8.0"
+#define APPVER L"2.8.1"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -772,18 +772,18 @@ static void DeskNext(MonBtn *b) { /* следующий стол; с после�
     int cnt = (idx >= 0 && idx == n - 1) ? n - 1 : 1;
     WORD vk = (cnt == 1) ? VK_RIGHT : VK_LEFT;
     LocalizeFocus(b);
-    INPUT in[2 + 2 * 64 + 2];
-    int k = 0;
-    ZeroMemory(in, sizeof in);
-    in[k].type = INPUT_KEYBOARD; in[k++].ki.wVk = VK_LWIN;
-    in[k].type = INPUT_KEYBOARD; in[k++].ki.wVk = VK_LCONTROL;
-    for (int i = 0; i < cnt && k < 2 + 2 * 64; i++) {
-        in[k].type = INPUT_KEYBOARD; in[k].ki.wVk = vk; in[k++].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
-        in[k].type = INPUT_KEYBOARD; in[k].ki.wVk = vk; in[k++].ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP;
+    /* как nircmd sendkeypress ctrl+lwin+стрелка: keybd_event, со скан-кодами и короткими паузами между нажатиями */
+    #define KE(vk, ext, up) keybd_event((BYTE)(vk), (BYTE)MapVirtualKeyW((vk), MAPVK_VK_TO_VSC), (DWORD)((ext ? KEYEVENTF_EXTENDEDKEY : 0) | ((up) ? KEYEVENTF_KEYUP : 0)), 0)
+    for (int i = 0; i < cnt; i++) {
+        KE(VK_CONTROL, 0, 0); Sleep(15);
+        KE(VK_LWIN, 1, 0); Sleep(15);
+        KE(vk, 1, 0); Sleep(15);
+        KE(vk, 1, 1); Sleep(15);
+        KE(VK_LWIN, 1, 1); Sleep(15);
+        KE(VK_CONTROL, 0, 1);
+        if (i + 1 < cnt) Sleep(120);
     }
-    in[k].type = INPUT_KEYBOARD; in[k].ki.wVk = VK_LCONTROL; in[k++].ki.dwFlags = KEYEVENTF_KEYUP;
-    in[k].type = INPUT_KEYBOARD; in[k].ki.wVk = VK_LWIN; in[k++].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput((UINT)k, in, sizeof(INPUT));
+    #undef KE
     Log(L"@nextdesk: стол %d из %d, шагов %ls x%d", idx + 1, n, vk == VK_RIGHT ? L"вправо" : L"влево", cnt);
 }
 static void CheckDesktopSwitch(void) {
