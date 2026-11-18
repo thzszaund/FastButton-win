@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.8.1"
+#define APPVER L"2.8.2"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -766,14 +766,10 @@ static void ShowDeskOverlay(int num) { /* num <= 0: показать номер 
     UpdateWindow(g_ovWnd);
     SetTimer(g_ovWnd, 1, (UINT)g_ov.dur, NULL);
 }
-static void DeskNext(MonBtn *b) { /* следующий стол; с последнего возвращаемся на первый */
-    int idx, n = DeskInfo(&idx);
-    if (n < 2) { Log(L"@nextdesk: столов меньше двух (n=%d)", n); if (g_ov.show) ShowDeskOverlay(1); return; }
-    int cnt = (idx >= 0 && idx == n - 1) ? n - 1 : 1;
-    WORD vk = (cnt == 1) ? VK_RIGHT : VK_LEFT;
-    LocalizeFocus(b);
-    /* как nircmd sendkeypress ctrl+lwin+стрелка: keybd_event, со скан-кодами и короткими паузами между нажатиями */
-    #define KE(vk, ext, up) keybd_event((BYTE)(vk), (BYTE)MapVirtualKeyW((vk), MAPVK_VK_TO_VSC), (DWORD)((ext ? KEYEVENTF_EXTENDEDKEY : 0) | ((up) ? KEYEVENTF_KEYUP : 0)), 0)
+static int IsElevated(void);
+/* Ctrl+Win+стрелка как nircmd sendkeypress: keybd_event, скан-коды, короткие паузы */
+static void DeskKeys(WORD vk, int cnt) {
+    #define KE(k, ext, up) keybd_event((BYTE)(k), (BYTE)MapVirtualKeyW((k), MAPVK_VK_TO_VSC), (DWORD)((ext ? KEYEVENTF_EXTENDEDKEY : 0) | ((up) ? KEYEVENTF_KEYUP : 0)), 0)
     for (int i = 0; i < cnt; i++) {
         KE(VK_CONTROL, 0, 0); Sleep(15);
         KE(VK_LWIN, 1, 0); Sleep(15);
@@ -784,6 +780,51 @@ static void DeskNext(MonBtn *b) { /* следующий стол; с после�
         if (i + 1 < cnt) Sleep(120);
     }
     #undef KE
+}
+/* запуск процесса с обычными правами (токен проводника), даже если мы запущены от администратора */
+static int RunUnelevated(const wchar_t *exe, wchar_t *cmd) {
+    int ok = 0;
+    HWND sh = GetShellWindow();
+    DWORD pid = 0;
+    if (!sh) return 0;
+    GetWindowThreadProcessId(sh, &pid);
+    HANDLE ph = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
+    if (!ph) return 0;
+    HANDLE tk = NULL, dup = NULL;
+    if (OpenProcessToken(ph, TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &tk) &&
+        DuplicateTokenEx(tk, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &dup)) {
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        memset(&si, 0, sizeof si);
+        si.cb = sizeof si;
+        memset(&pi, 0, sizeof pi);
+        if (CreateProcessWithTokenW(dup, 0, exe, cmd, 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            ok = 1;
+        } else Log(L"RunUnelevated: CreateProcessWithTokenW ошибка %lu", (unsigned long)GetLastError());
+    }
+    if (dup) CloseHandle(dup);
+    if (tk) CloseHandle(tk);
+    CloseHandle(ph);
+    return ok;
+}
+static void DeskNext(MonBtn *b) { /* следующий стол; с последнего возвращаемся на первый */
+    int idx, n = DeskInfo(&idx);
+    if (n < 2) { Log(L"@nextdesk: столов меньше двух (n=%d)", n); if (g_ov.show) ShowDeskOverlay(1); return; }
+    int cnt = (idx >= 0 && idx == n - 1) ? n - 1 : 1;
+    WORD vk = (cnt == 1) ? VK_RIGHT : VK_LEFT;
+    LocalizeFocus(b);
+    int viaHelper = 0;
+    if (IsElevated()) { /* из процесса с правами администратора Win+Ctrl+стрелка срабатывает нестабильно: жмём клавиши из обычного процесса */
+        wchar_t exe[MAX_PATH], cmd[MAX_PATH + 40];
+        GetModuleFileNameW(NULL, exe, MAX_PATH);
+        _snwprintf(cmd, MAX_PATH + 40, L"\"%ls\" /deskkeys %ls %d", exe, vk == VK_RIGHT ? L"R" : L"L", cnt);
+        cmd[MAX_PATH + 39] = 0;
+        viaHelper = RunUnelevated(exe, cmd);
+        Log(L"@nextdesk: клавиши из обычного процесса: %ls", viaHelper ? L"да" : L"НЕ УДАЛОСЬ, жму напрямую");
+    }
+    if (!viaHelper) DeskKeys(vk, cnt);
     Log(L"@nextdesk: стол %d из %d, шагов %ls x%d", idx + 1, n, vk == VK_RIGHT ? L"вправо" : L"влево", cnt);
 }
 static void CheckDesktopSwitch(void) {
@@ -3545,8 +3586,17 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
-    (void)hp; (void)cl; (void)ns;
+    (void)hp; (void)ns;
     g_hinst = hi;
+    if (cl && !wcsncmp(cl, L"/deskkeys", 9)) { /* помощник: только нажать Ctrl+Win+стрелка и выйти */
+        const wchar_t *q = cl + 9;
+        while (*q == L' ') q++;
+        WORD vk = (*q == L'L' || *q == L'l') ? VK_LEFT : VK_RIGHT;
+        q++;
+        int n = _wtoi(q);
+        DeskKeys(vk, Clamp(n, 1, 63));
+        return 0;
+    }
     HANDLE mtx = CreateMutexW(NULL, FALSE, L"Local\\CornerBtn_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
     (void)mtx;
