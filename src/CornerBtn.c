@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.11.0"
+#define APPVER L"2.12.0"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -76,10 +76,11 @@ static HTREEITEM g_htis[NSEC][MAXE];
 #define g_hti g_htis[g_cur]
 static Act g_click, g_dbl, g_mid;
 static Act g_tclick, g_tdbl, g_tmid; /* действия на клики по значку в трее */
-static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; int midItem; int content, numBold, numScale, trayNum, trayBold, trayDup; wchar_t numFont[64], trayFont[64]; COLORREF numFg, numFgH, numBg, numBgH, trayFg, trayBg; } g_cfg; /* content: 0 цвет, 1 иконка, 2 номер стола */
+static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; int midItem; int content, numBold, numScale, trayNum, trayBold, trayDup, trayByDesk; wchar_t numFont[64], trayFont[64]; COLORREF numFg, numFgH, numBg, numBgH, trayFg, trayBg; } g_cfg; /* content: 0 цвет, 1 иконка, 2 номер стола */
 static wchar_t g_excl[MAXLIST][64], g_remote[MAXLIST][64];
 static int g_nexcl, g_nremote;
 static HICON g_icon;
+static COLORREF g_trayBgN[8], g_trayFgN[8]; /* цвета значка в трее для столов 1..8 (дальше по кругу) */
 static int g_deskNum; /* номер текущего виртуального стола (0 = неизвестен) */
 static int g_inMenu, g_modal, g_debug;
 static wchar_t g_log[MAX_PATH];
@@ -428,6 +429,16 @@ static void LoadAll(void) {
     g_cfg.trayBold = GetI(L"NumTray", L"Bold", 1) ? 1 : 0;
     GetS(L"NumTray", L"TextColor", L"FFFFFF", b, 64);  g_cfg.trayFg = ParseColor(b, RGB(255, 255, 255));
     GetS(L"NumTray", L"BgColor", L"3399FF", b, 64);    g_cfg.trayBg = ParseColor(b, RGB(0x33, 0x99, 0xFF));
+    g_cfg.trayByDesk = GetI(L"NumTray", L"ColorByDesktop", 0) ? 1 : 0;
+    {
+        static const wchar_t *defBg[8] = { L"3399FF", L"2E9E4F", L"F28C28", L"D9435B", L"8E5BD9", L"1FA8A0", L"E05CA8", L"6B7280" };
+        for (int i = 0; i < 8; i++) {
+            wchar_t kb[16], kf[16];
+            _snwprintf(kb, 16, L"Bg%d", i + 1); _snwprintf(kf, 16, L"Fg%d", i + 1);
+            GetS(L"NumTray", kb, defBg[i], b, 64);     g_trayBgN[i] = ParseColor(b, RGB(0x33, 0x99, 0xFF));
+            GetS(L"NumTray", kf, L"FFFFFF", b, 64);    g_trayFgN[i] = ParseColor(b, RGB(255, 255, 255));
+        }
+    }
 
     GetS(L"Click", L"Action", L"@mondesk", g_click.action, 520);
     GetS(L"Click", L"Args", L"", g_click.args, 260);
@@ -499,6 +510,13 @@ static void SaveCfg(void) {
     PUTCOL(L"NumButton", L"BgColorHover", g_cfg.numBgH);
     PUTCOL(L"NumTray", L"TextColor", g_cfg.trayFg);
     PUTCOL(L"NumTray", L"BgColor", g_cfg.trayBg);
+    PutI(L"NumTray", L"ColorByDesktop", g_cfg.trayByDesk);
+    for (int i = 0; i < 8; i++) {
+        wchar_t kb[16], kf[16];
+        _snwprintf(kb, 16, L"Bg%d", i + 1); _snwprintf(kf, 16, L"Fg%d", i + 1);
+        PUTCOL(L"NumTray", kb, g_trayBgN[i]);
+        PUTCOL(L"NumTray", kf, g_trayFgN[i]);
+    }
 #undef PUTCOL
     PutI(L"DeskOverlay", L"Show", g_ov.show);
     PutS(L"DeskOverlay", L"Font", g_ov.font);
@@ -1909,7 +1927,9 @@ static HICON MakeNumIcon(int num, const wchar_t *font, int bold, COLORREF fg, CO
 }
 static HICON TrayCurIcon(void) {
     if (g_cfg.trayNum) {
-        HICON ic = MakeNumIcon(g_deskNum, g_cfg.trayFont, g_cfg.trayBold, g_cfg.trayFg, g_cfg.trayBg);
+        COLORREF fg = g_cfg.trayFg, bg = g_cfg.trayBg;
+        if (g_cfg.trayByDesk && g_deskNum > 0) { fg = g_trayFgN[(g_deskNum - 1) % 8]; bg = g_trayBgN[(g_deskNum - 1) % 8]; }
+        HICON ic = MakeNumIcon(g_deskNum, g_cfg.trayFont, g_cfg.trayBold, fg, bg);
         if (ic) {
             if (g_trayNumIcon) DestroyIcon(g_trayNumIcon);
             g_trayNumIcon = ic;
@@ -2749,6 +2769,9 @@ typedef struct {
     HWND chAuto, chDebug, eEditor, cbMid;
     Act ta[3];
     HWND stTAct[3], chTDup;
+    COLORREF tmpBg[8], tmpFg[8];
+    int tsel;
+    HWND chTByD, cbTDesk, eTDFg, eTDBg;
     HWND cbContent, eNFont, chNBold, eNScale, eNFg, eNFgH, eNBg, eNBgH, chTray, eTFont, chTBold, eTFg, eTBg;
     HWND chOv, chOvBold, eOvFont, eOvSize, eOvOp, eOvCol, eOvOut, eOvOutW, eOvDur, cbOvPos;
 } SetDlg;
@@ -3039,6 +3062,31 @@ static void PgNum(SetDlg *s, HWND pg) {
     y += 30;
     NumRow(pg, s, &s->eTFg, L"Цвет цифры в трее:", y, 975, 976, g_cfg.trayFg); y += 30;
     NumRow(pg, s, &s->eTBg, L"Фон значка в трее:", y, 977, 978, g_cfg.trayBg);
+    y += 40;
+    s->chTByD = Chkbox(pg, L"Менять цвета значка в трее в зависимости от номера стола (виден номер по цвету)", 12, y, 740, 979, g_cfg.trayByDesk);
+    y += 30;
+    for (int i = 0; i < 8; i++) { s->tmpBg[i] = g_trayBgN[i]; s->tmpFg[i] = g_trayFgN[i]; }
+    s->tsel = 0;
+    Lbl(pg, L"Цвета для стола № (после 8-го по кругу):", 12, y + 3, 260, 20);
+    s->cbTDesk = Mk(pg, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, 280, y, 90, 220, 980);
+    for (int i = 1; i <= 8; i++) { wchar_t t[8]; _snwprintf(t, 8, L"%d", i); SendMessageW(s->cbTDesk, CB_ADDSTRING, 0, (LPARAM)t); }
+    SendMessageW(s->cbTDesk, CB_SETCURSEL, 0, 0);
+    y += 30;
+    NumRow(pg, s, &s->eTDFg, L"Цвет цифры для этого стола:", y, 981, 982, s->tmpFg[0]); y += 30;
+    NumRow(pg, s, &s->eTDBg, L"Фон значка для этого стола:", y, 983, 984, s->tmpBg[0]);
+}
+static void TDeskStore(SetDlg *s) { /* запомнить цвета, показанные в полях, для выбранного стола */
+    wchar_t b[32];
+    GetWindowTextW(s->eTDFg, b, 32); s->tmpFg[s->tsel] = ParseColor(b, s->tmpFg[s->tsel]);
+    GetWindowTextW(s->eTDBg, b, 32); s->tmpBg[s->tsel] = ParseColor(b, s->tmpBg[s->tsel]);
+}
+static void TDeskShow(SetDlg *s) {
+    wchar_t b[16];
+    int i = (int)SendMessageW(s->cbTDesk, CB_GETCURSEL, 0, 0);
+    if (i < 0 || i > 7) i = 0;
+    s->tsel = i;
+    _snwprintf(b, 16, L"%02X%02X%02X", GetRValue(s->tmpFg[i]), GetGValue(s->tmpFg[i]), GetBValue(s->tmpFg[i])); SetWindowTextW(s->eTDFg, b);
+    _snwprintf(b, 16, L"%02X%02X%02X", GetRValue(s->tmpBg[i]), GetGValue(s->tmpBg[i]), GetBValue(s->tmpBg[i])); SetWindowTextW(s->eTDBg, b);
 }
 static void PgExcl(SetDlg *s, HWND pg, int PW, int PH) {
     int eh = (PH - 190) / 2;
@@ -3140,6 +3188,9 @@ static int SetApply(SetDlg *s) {
         GetWindowTextW(s->eNBg, b, 32);  g_cfg.numBg = ParseColor(b, g_cfg.numBg);
         GetWindowTextW(s->eNBgH, b, 32); g_cfg.numBgH = ParseColor(b, g_cfg.numBgH);
         g_cfg.trayNum = Chk(s->chTray);
+        TDeskStore(s);
+        g_cfg.trayByDesk = Chk(s->chTByD);
+        for (int i = 0; i < 8; i++) { g_trayBgN[i] = s->tmpBg[i]; g_trayFgN[i] = s->tmpFg[i]; }
         GetWindowTextW(s->eTFont, g_cfg.trayFont, 64); Trim(g_cfg.trayFont);
         if (!g_cfg.trayFont[0]) cp(g_cfg.trayFont, 64, L"Segoe UI");
         g_cfg.trayBold = Chk(s->chTBold);
@@ -3213,6 +3264,9 @@ static void SetCmd(Dlg *d, int id, int code) {
     case 967: PickOvColor(s, d->h, s->eNFgH, g_cfg.numFgH); break;
     case 969: PickOvColor(s, d->h, s->eNBg, g_cfg.numBg); break;
     case 971: PickOvColor(s, d->h, s->eNBgH, g_cfg.numBgH); break;
+    case 980: if (code == CBN_SELCHANGE) { TDeskStore(s); TDeskShow(s); } break;
+    case 982: PickOvColor(s, d->h, s->eTDFg, s->tmpFg[s->tsel]); break;
+    case 984: PickOvColor(s, d->h, s->eTDBg, s->tmpBg[s->tsel]); break;
     case 976: PickOvColor(s, d->h, s->eTFg, g_cfg.trayFg); break;
     case 978: PickOvColor(s, d->h, s->eTBg, g_cfg.trayBg); break;
     case 932: SetApply(s); ShowDeskOverlay(2); break;
@@ -3401,7 +3455,7 @@ static void HandleCmd(int cmd, MonBtn *b) {
     }
 }
 /* ---------- правая кнопка на пункте меню: свои действия ---------- */
-enum { CX_SHELL = 3001, CX_REVEAL, CX_COPYPATH, CX_COPYFILE, CX_PROPS, CX_EDIT };
+enum { CX_SHELL = 3001, CX_REVEAL, CX_COPYPATH, CX_COPYFILE, CX_PROPS, CX_EDIT, CX_RENAME };
 static IContextMenu2 *g_cm2;
 static IContextMenu3 *g_cm3;
 static HHOOK g_mhook;
@@ -3520,6 +3574,7 @@ static int EntryCtxChoose(int sec, int idx, POINT pt) { /* показать ко
     AppendMenuW(m, MF_STRING | gr, CX_SHELL, L"Контекстное меню Explorer");
     AppendMenuW(m, MF_STRING | gr, CX_REVEAL, L"Показать в папке");
     AppendMenuW(m, MF_STRING, CX_COPYPATH, L"Скопировать путь");
+    AppendMenuW(m, MF_STRING, CX_RENAME, L"Переименовать пункт меню");
     AppendMenuW(m, MF_STRING | gr, CX_COPYFILE, L"Скопировать");
     AppendMenuW(m, MF_STRING | gr, CX_PROPS, L"Свойства");
     if (script) {
@@ -3543,6 +3598,15 @@ static void EntryCtxRun(int sec, int idx, POINT pt, int cmd) { /* выполни
     switch (cmd) {
     case CX_SHELL: ShellContextMenu(path, pt); break;
     case CX_REVEAL: RevealPath(path); break;
+    case CX_RENAME: {
+        wchar_t nm[128];
+        cp(nm, 128, e->name);
+        g_modal = 1;
+        int okr = EditActDlg(AM_FOLDER, L"Переименовать пункт меню", nm, NULL, NULL, NULL, NULL);
+        g_modal = 0;
+        if (okr && nm[0]) { cp(e->name, 128, nm); SaveAll(); }
+        break;
+    }
     case CX_COPYPATH: {
         static wchar_t buf[3000], args[1300];
         if (sec == SEC_PROG || sec == SEC_SCRIPT) { /* путь с аргументами запуска */
