@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.14.0"
+#define APPVER L"2.15.0"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -871,6 +871,8 @@ static void ShowDeskOverlay(int num) { /* num <= 0: показать номер 
     HFONT f = CreateFontW(-S(g_ov.size), 0, 0, 0, g_ov.bold ? FW_BOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, g_ov.font);
     HFONT of = (HFONT)SelectObject(dc, f);
     SIZE sz;
+    TEXTMETRICW tmN;
+    GetTextMetricsW(dc, &tmN);
     GetTextExtentPoint32W(dc, t, (int)wcslen(t), &sz);
     SelectObject(dc, of);
     DeleteObject(f);
@@ -904,6 +906,8 @@ static void ShowDeskOverlay(int num) { /* num <= 0: показать номер 
             HFONT f2 = CreateFontW(-S(g_ov.capSize), 0, 0, 0, g_ov.bold ? FW_BOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, g_ov.font);
             HFONT of2 = (HFONT)SelectObject(dc2, f2);
             SIZE sz2;
+            TEXTMETRICW tmC;
+            GetTextMetricsW(dc2, &tmC);
             GetTextExtentPoint32W(dc2, nm, (int)wcslen(nm), &sz2);
             SelectObject(dc2, of2);
             DeleteObject(f2);
@@ -911,7 +915,14 @@ static void ShowDeskOverlay(int num) { /* num <= 0: показать номер 
             int cw2 = sz2.cx + 2 * pad, ch2 = sz2.cy + 2 * pad;
             if (cw2 > r.right - r.left) cw2 = r.right - r.left;
             int cx2, cy2;
-            if (g_ov.capPos <= 1) { cx2 = x + w / 2 - cw2 / 2; cy2 = g_ov.capPos == 0 ? y + h : y - ch2; }
+            if (g_ov.capPos <= 1) { /* вплотную к цифре: считаем по видимым границам глифов, а не по краям окон */
+                int gap = S(4);
+                int capHN = (tmN.tmHeight - tmN.tmInternalLeading) * 72 / 100; /* высота цифр */
+                int capHC = (tmC.tmHeight - tmC.tmInternalLeading) * 72 / 100; /* высота заглавных у надписи */
+                cx2 = x + w / 2 - cw2 / 2;
+                if (g_ov.capPos == 0) cy2 = y + tmN.tmAscent + gap - (tmC.tmAscent - capHC);
+                else cy2 = y + tmN.tmAscent - capHN - gap - tmC.tmAscent;
+            }
             else {
                 int gp = g_ov.capPos - 2, gc = gp % 3, gr = gp / 3;
                 cx2 = gc == 0 ? r.left + mx : (gc == 1 ? (r.left + r.right - cw2) / 2 : r.right - cw2 - mx);
@@ -3856,7 +3867,7 @@ static void HandleCmd(int cmd, MonBtn *b) {
     }
 }
 /* ---------- правая кнопка на пункте меню: свои действия ---------- */
-enum { CX_SHELL = 3001, CX_REVEAL, CX_COPYPATH, CX_COPYFILE, CX_PROPS, CX_EDIT, CX_RENAME };
+enum { CX_SHELL = 3001, CX_REVEAL, CX_COPYPATH, CX_COPYFILE, CX_PROPS, CX_EDIT, CX_RENAME, CX_OPEN, CX_ADMIN, CX_COPYNAME, CX_COPYCMD };
 static IContextMenu2 *g_cm2;
 static IContextMenu3 *g_cm3;
 static HHOOK g_mhook;
@@ -3962,26 +3973,37 @@ static void ShellContextMenu(const wchar_t *path, POINT pt) { /* обычное 
     CoTaskMemFree(pidl);
 }
 static int g_pendCmd; /* команда контекстного меню, выбранная при открытом основном меню */
-static int EntryCtxChoose(int sec, int idx, POINT pt) { /* показать контекстное меню пункта, вернуть команду */
+static int EntryIsCommand(int sec, int exists) { return sec == SEC_SCRIPT && !exists; } /* в «Скриптах и командах» это не файл, а команда */
+static int EntryCtxChoose(int sec, int idx, POINT pt) { /* контекстное меню пункта: набор зависит от раздела; возвращает команду */
     int exists = 0;
     wchar_t path[1100];
     if (sec < 0 || sec >= NSEC || idx < 0 || idx >= g_cnt[sec]) return 0;
     Entry *e = &g_ent[sec][idx];
     if (!EntryTarget(e, path, 1100, &exists)) return 0;
     int isDir = exists && IsDirPath(path);
-    int script = exists && !isDir && (sec == SEC_SCRIPT || IsScriptExt(path));
+    int cmdMode = EntryIsCommand(sec, exists);
+    int editable = exists && !isDir && (sec == SEC_SCRIPT || sec == SEC_FILES || IsScriptExt(path));
     UINT gr = exists ? 0 : MF_GRAYED;
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING | gr, CX_SHELL, L"Контекстное меню Explorer");
-    AppendMenuW(m, MF_STRING | gr, CX_REVEAL, L"Показать в папке");
-    AppendMenuW(m, MF_STRING, CX_COPYPATH, L"Скопировать путь");
-    AppendMenuW(m, MF_STRING, CX_RENAME, L"Переименовать пункт меню");
-    AppendMenuW(m, MF_STRING | gr, CX_COPYFILE, L"Скопировать");
-    AppendMenuW(m, MF_STRING | gr, CX_PROPS, L"Свойства");
-    if (script) {
+    const wchar_t *openLbl = sec == SEC_FOLDER ? L"Открыть папку" : (sec == SEC_FILES ? L"Открыть" : L"Запустить");
+    AppendMenuW(m, MF_STRING, CX_OPEN, openLbl);
+    if (sec == SEC_PROG || sec == SEC_SCRIPT) AppendMenuW(m, MF_STRING | (cmdMode ? 0 : gr), CX_ADMIN, L"Запустить от имени администратора");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    if (!cmdMode) {
+        AppendMenuW(m, MF_STRING | gr, CX_SHELL, L"Контекстное меню Explorer");
+        AppendMenuW(m, MF_STRING | gr, CX_REVEAL, sec == SEC_FOLDER ? L"Показать папку в проводнике" : (sec == SEC_PROG ? L"Показать программу в папке" : (sec == SEC_SCRIPT ? L"Показать скрипт в папке" : L"Показать файл в папке")));
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(m, MF_STRING, CX_EDIT, g_cfg.editor[0] ? L"Открыть в текстовом редакторе" : L"Открыть в блокноте");
+        AppendMenuW(m, MF_STRING, CX_COPYPATH, (sec == SEC_PROG || sec == SEC_SCRIPT) ? L"Скопировать полный путь (с аргументами)" : L"Скопировать полный путь");
+        AppendMenuW(m, MF_STRING, CX_COPYNAME, sec == SEC_FOLDER ? L"Скопировать имя папки" : (sec == SEC_PROG ? L"Скопировать имя программы" : (sec == SEC_SCRIPT ? L"Скопировать имя скрипта" : L"Скопировать имя файла")));
+        AppendMenuW(m, MF_STRING | gr, CX_COPYFILE, sec == SEC_FOLDER ? L"Скопировать папку в буфер" : (sec == SEC_PROG ? L"Скопировать программу в буфер" : (sec == SEC_SCRIPT ? L"Скопировать скрипт в буфер" : L"Скопировать файл в буфер")));
+    } else {
+        AppendMenuW(m, MF_STRING, CX_COPYCMD, L"Скопировать команду");
     }
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    if (editable) AppendMenuW(m, MF_STRING, CX_EDIT, g_cfg.editor[0] ? L"Открыть в текстовом редакторе" : L"Открыть в блокноте");
+    if (!cmdMode) AppendMenuW(m, MF_STRING | gr, CX_PROPS, L"Свойства");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, CX_RENAME, L"Переименовать пункт меню");
     g_inMenu = 1;
     if (!g_nested) SetForegroundWindow(g_ctl);
     int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_ctl, NULL);
@@ -3997,17 +4019,21 @@ static void EntryCtxRun(int sec, int idx, POINT pt, int cmd) { /* выполни
     Entry *e = &g_ent[sec][idx];
     if (!EntryTarget(e, path, 1100, &exists)) return;
     switch (cmd) {
+    case CX_OPEN: RunEntry(sec, idx, NULL); break;
+    case CX_ADMIN:
+        if (sec == SEC_SCRIPT) { Entry tmp = *e; tmp.flags |= 1; RunScript(&tmp); }
+        else {
+            wchar_t args[1300], dir[MAX_PATH * 2];
+            ExpandEnvironmentStringsW(e->args, args, 1300);
+            cp(dir, WSZ(dir), path);
+            wchar_t *sl = wcsrchr(dir, L'\\');
+            if (sl) *sl = 0; else cp(dir, WSZ(dir), g_dir);
+            HINSTANCE r = ShellExecuteW(NULL, L"runas", path, args[0] ? args : NULL, dir, SW_SHOWNORMAL);
+            if ((INT_PTR)r <= 32 && (INT_PTR)r != 5) MessageBoxW(NULL, L"Не удалось запустить от имени администратора.", APPNAME, MB_ICONWARNING);
+        }
+        break;
     case CX_SHELL: ShellContextMenu(path, pt); break;
     case CX_REVEAL: RevealPath(path); break;
-    case CX_RENAME: {
-        wchar_t nm[128];
-        cp(nm, 128, e->name);
-        g_modal = 1;
-        int okr = EditActDlg(AM_FOLDER, L"Переименовать пункт меню", nm, NULL, NULL, NULL, NULL);
-        g_modal = 0;
-        if (okr && nm[0]) { cp(e->name, 128, nm); SaveAll(); }
-        break;
-    }
     case CX_COPYPATH: {
         static wchar_t buf[3000], args[1300];
         if (sec == SEC_PROG || sec == SEC_SCRIPT) { /* путь с аргументами запуска */
@@ -4019,11 +4045,38 @@ static void EntryCtxRun(int sec, int idx, POINT pt, int cmd) { /* выполни
         if (CopyText(buf)) Balloon(L"Путь скопирован", buf);
         break;
     }
+    case CX_COPYNAME: {
+        const wchar_t *nm = wcsrchr(path, L'\\');
+        wchar_t buf[600];
+        cp(buf, WSZ(buf), nm ? nm + 1 : path);
+        if (!buf[0]) cp(buf, WSZ(buf), path); /* корень диска */
+        if (CopyText(buf)) Balloon(L"Имя скопировано", buf);
+        break;
+    }
+    case CX_COPYCMD: {
+        static wchar_t buf[2000];
+        wchar_t args[1300];
+        ExpandEnvironmentStringsW(e->args, args, 1300);
+        Trim(args);
+        if (args[0]) _snwprintf(buf, 2000, L"%ls %ls", e->action, args); else cp(buf, WSZ(buf), e->action);
+        buf[1999] = 0;
+        if (CopyText(buf)) Balloon(L"Команда скопирована", buf);
+        break;
+    }
     case CX_COPYFILE:
         if (CopyFileToClipboard(path)) Balloon(L"Скопировано в буфер обмена (можно вставить в проводнике)", path);
         break;
     case CX_PROPS: ShowProps(path); break;
     case CX_EDIT: OpenInEditor(path); break;
+    case CX_RENAME: {
+        wchar_t nm[128];
+        cp(nm, 128, e->name);
+        g_modal = 1;
+        int okr = EditActDlg(AM_FOLDER, L"Переименовать пункт меню", nm, NULL, NULL, NULL, NULL);
+        g_modal = 0;
+        if (okr && nm[0]) { cp(e->name, 128, nm); SaveAll(); }
+        break;
+    }
     }
 }
 static void ShowEntryContext(void) { /* после закрытия основного меню: выполнить отложенную команду (или показать меню) */
