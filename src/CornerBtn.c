@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.15.0"
+#define APPVER L"2.15.1"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -1853,6 +1853,8 @@ static int RunModal(Dlg *d, HWND owner) {
 /* --- диалог действия / пункта / папки --- */
 enum { AM_ACTION = 0, AM_ITEM = 1, AM_FOLDER = 2 };
 static int Chk(HWND h);
+static int BrowseOpenAt(HWND owner, const wchar_t *filter, const wchar_t *cur, wchar_t *out, int n);
+static int BrowseDirAt(HWND owner, const wchar_t *cur, wchar_t *out);
 static HWND Chkbox(HWND p, const wchar_t *t, int x, int y, int w, int id, int on);
 typedef struct { Dlg d; int mode; wchar_t name[128], action[520], args[260]; int hide; HWND eName, cb, ePath, eArgs, chHide; } ActDlg;
 
@@ -1871,29 +1873,15 @@ static void ActCmd(Dlg *d, int id, int code) {
         if (code == CBN_SELCHANGE) ActEnable(a);
         break;
     case 305: {
-        wchar_t f[MAX_PATH] = L"";
-        OPENFILENAMEW o;
-        memset(&o, 0, sizeof o);
-        o.lStructSize = sizeof o;
-        o.hwndOwner = d->h;
-        o.lpstrFilter = L"Программы и скрипты\0*.exe;*.com;*.bat;*.cmd;*.vbs;*.vbe;*.js;*.jse;*.wsf;*.ps1;*.py;*.lnk\0Все файлы\0*.*\0";
-        o.lpstrFile = f;
-        o.nMaxFile = MAX_PATH;
-        o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        if (GetOpenFileNameW(&o)) SetWindowTextW(a->ePath, f);
+        wchar_t f[MAX_PATH] = L"", cur[1100];
+        GetWindowTextW(a->ePath, cur, 1100);
+        if (BrowseOpenAt(d->h, L"Программы и скрипты\0*.exe;*.com;*.bat;*.cmd;*.vbs;*.vbe;*.js;*.jse;*.wsf;*.ps1;*.py;*.lnk\0Все файлы\0*.*\0", cur, f, MAX_PATH)) SetWindowTextW(a->ePath, f);
         break;
     }
     case 306: {
-        BROWSEINFOW bi;
-        memset(&bi, 0, sizeof bi);
-        bi.hwndOwner = d->h;
-        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-        LPITEMIDLIST p = SHBrowseForFolderW(&bi);
-        if (p) {
-            wchar_t f[MAX_PATH];
-            if (SHGetPathFromIDListW(p, f)) SetWindowTextW(a->ePath, f);
-            CoTaskMemFree(p);
-        }
+        wchar_t f[MAX_PATH], cur[1100];
+        GetWindowTextW(a->ePath, cur, 1100);
+        if (BrowseDirAt(d->h, cur, f)) SetWindowTextW(a->ePath, f);
         break;
     }
     case IDOK:
@@ -2521,23 +2509,62 @@ static HWND Chkbox(HWND p, const wchar_t *t, int x, int y, int w, int id, int on
     SendMessageW(c, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
     return c;
 }
-static int BrowseOpen(HWND owner, const wchar_t *filter, wchar_t *out, int n) {
-    OPENFILENAMEW o;
+static void BrowseNorm(const wchar_t *in, wchar_t *out, int n) { /* путь из поля: переменные окружения, без кавычек */
+    wchar_t t[1100];
     out[0] = 0;
+    if (!in || !in[0]) return;
+    ExpandEnvironmentStringsW(in, t, 1100);
+    Trim(t);
+    size_t l = wcslen(t);
+    if (l > 1 && t[0] == L'"' && t[l - 1] == L'"') { t[l - 1] = 0; memmove(t, t + 1, l * sizeof(wchar_t)); }
+    cp(out, (size_t)n, t);
+}
+static int BrowseOpenAt(HWND owner, const wchar_t *filter, const wchar_t *cur, wchar_t *out, int n) {
+    OPENFILENAMEW o;
+    wchar_t c[1100], dir[1100] = L"";
+    out[0] = 0;
+    BrowseNorm(cur, c, 1100);
+    if (c[0]) {
+        DWORD at = GetFileAttributesW(c);
+        if (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY)) cp(dir, WSZ(dir), c);
+        else {
+            if (at != INVALID_FILE_ATTRIBUTES) cp(out, (size_t)n, c); /* файл существует: он будет выбран в окне */
+            wchar_t par[1100];
+            cp(par, WSZ(par), c);
+            wchar_t *sl = wcsrchr(par, L'\\');
+            if (sl) { *sl = 0; if (GetFileAttributesW(par) != INVALID_FILE_ATTRIBUTES) cp(dir, WSZ(dir), par); }
+        }
+    }
     memset(&o, 0, sizeof o);
     o.lStructSize = sizeof o;
     o.hwndOwner = owner;
     o.lpstrFilter = filter;
     o.lpstrFile = out;
     o.nMaxFile = (DWORD)n;
+    o.lpstrInitialDir = dir[0] ? dir : NULL;
     o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_NODEREFERENCELINKS;
     return GetOpenFileNameW(&o) ? 1 : 0;
 }
-static int BrowseDir(HWND owner, wchar_t *out) {
+static int BrowseOpen(HWND owner, const wchar_t *filter, wchar_t *out, int n) { return BrowseOpenAt(owner, filter, NULL, out, n); }
+static int CALLBACK BrowseDirCb(HWND h, UINT m, LPARAM l, LPARAM data) {
+    (void)l;
+    if (m == BFFM_INITIALIZED && data) SendMessageW(h, BFFM_SETSELECTIONW, TRUE, data);
+    return 0;
+}
+static int BrowseDirAt(HWND owner, const wchar_t *cur, wchar_t *out) {
     BROWSEINFOW bi;
+    wchar_t c[1100];
+    BrowseNorm(cur, c, 1100);
+    if (c[0] && GetFileAttributesW(c) == INVALID_FILE_ATTRIBUTES) { /* нет такой папки: берём родительскую */
+        wchar_t *sl = wcsrchr(c, L'\\');
+        if (sl) *sl = 0; else c[0] = 0;
+        if (c[0] && GetFileAttributesW(c) == INVALID_FILE_ATTRIBUTES) c[0] = 0;
+    }
     memset(&bi, 0, sizeof bi);
     bi.hwndOwner = owner;
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    bi.lpfn = BrowseDirCb;
+    bi.lParam = c[0] ? (LPARAM)c : 0;
     LPITEMIDLIST p = SHBrowseForFolderW(&bi);
     if (!p) return 0;
     int ok = SHGetPathFromIDListW(p, out) ? 1 : 0;
@@ -2703,12 +2730,17 @@ static void EntCmd(Dlg *d, int id, int code) {
         const wchar_t *flt = a->sec == SEC_FILES ? L"Все файлы\0*.*\0" : a->sec == SEC_SCRIPT
             ? L"Скрипты\0*.bat;*.cmd;*.vbs;*.vbe;*.js;*.jse;*.wsf;*.wsh;*.ps1;*.py;*.pyw\0Все файлы\0*.*\0"
             : L"Программы и ярлыки\0*.exe;*.com;*.bat;*.cmd;*.lnk\0Все файлы\0*.*\0";
-        if (BrowseOpen(d->h, flt, f, MAX_PATH)) { SetWindowTextW(a->ePath, f); EntAutoName(a, f); }
+        wchar_t cur[1100];
+        GetWindowTextW(a->ePath, cur, 1100);
+        if (BrowseOpenAt(d->h, flt, cur, f, MAX_PATH)) { SetWindowTextW(a->ePath, f); EntAutoName(a, f); }
         break;
     }
-    case ED_BDIR:
-        if (BrowseDir(d->h, f)) { SetWindowTextW(a->ePath, f); EntAutoName(a, f); }
+    case ED_BDIR: {
+        wchar_t cur[1100];
+        GetWindowTextW(a->ePath, cur, 1100);
+        if (BrowseDirAt(d->h, cur, f)) { SetWindowTextW(a->ePath, f); EntAutoName(a, f); }
         break;
+    }
     case ED_BINTERP:
         if (BrowseOpen(d->h, L"Программы\0*.exe;*.com;*.bat;*.cmd\0Все файлы\0*.*\0", f, MAX_PATH)) {
             wchar_t q[MAX_PATH + 4];
@@ -2718,8 +2750,12 @@ static void EntCmd(Dlg *d, int id, int code) {
         }
         break;
     case ED_BICON:
-        if (BrowseOpen(d->h, L"Иконки (*.ico;*.exe;*.dll)\0*.ico;*.exe;*.dll\0Все файлы\0*.*\0", f, MAX_PATH)) SetWindowTextW(a->eIcon, f);
+    {
+        wchar_t cur[1100];
+        GetWindowTextW(a->eIcon, cur, 1100);
+        if (BrowseOpenAt(d->h, L"Иконки (*.ico;*.exe;*.dll)\0*.ico;*.exe;*.dll\0Все файлы\0*.*\0", cur, f, MAX_PATH)) SetWindowTextW(a->eIcon, f);
         break;
+    }
     case IDOK: {
         Entry *e = &a->e;
         GetWindowTextW(a->eName, e->name, 128);
@@ -3973,6 +4009,7 @@ static void ShellContextMenu(const wchar_t *path, POINT pt) { /* обычное 
     CoTaskMemFree(pidl);
 }
 static int g_pendCmd; /* команда контекстного меню, выбранная при открытом основном меню */
+static int g_ctxFail; /* вложенное контекстное меню не открылось: используем запасной путь */
 static int EntryIsCommand(int sec, int exists) { return sec == SEC_SCRIPT && !exists; } /* в «Скриптах и командах» это не файл, а команда */
 static int EntryCtxChoose(int sec, int idx, POINT pt) { /* контекстное меню пункта: набор зависит от раздела; возвращает команду */
     int exists = 0;
@@ -4006,7 +4043,13 @@ static int EntryCtxChoose(int sec, int idx, POINT pt) { /* контекстно�
     AppendMenuW(m, MF_STRING, CX_RENAME, L"Переименовать пункт меню");
     g_inMenu = 1;
     if (!g_nested) SetForegroundWindow(g_ctl);
+    SetLastError(0);
     int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_ctl, NULL);
+    DWORD err = GetLastError();
+    if (!cmd && err && g_nested) {
+        g_ctxFail = 1;
+        Log(L"контекстное меню пункта: вложенный TrackPopupMenu не открылся (ошибка %lu), использую запасной путь", (unsigned long)err);
+    } else Log(L"контекстное меню пункта: раздел %d, пункт %d, команда %d, вложенное=%d", sec, idx, cmd, g_nested);
     PostMessageW(g_ctl, WM_NULL, 0, 0);
     if (!g_nested) g_inMenu = 0;
     DestroyMenu(m);
@@ -4100,6 +4143,15 @@ static int CtxFromItem(HMENU hm, int pos, POINT pt) { /* 1 = клик обраб
     g_nested = 1;
     int cmd = EntryCtxChoose(sec, idx, pt);
     g_nested = 0;
+    if (g_ctxFail) { /* поверх открытого меню не получилось: закрываем основное и показываем контекстное после него */
+        g_ctxFail = 0;
+        g_ctxSec = sec;
+        g_ctxIdx = idx;
+        g_ctxPt = pt;
+        g_pendCmd = 0;
+        EndMenu();
+        return 1;
+    }
     if (cmd > 0) { /* команду выполним после закрытия основного меню */
         g_ctxSec = sec;
         g_ctxIdx = idx;
@@ -4144,8 +4196,14 @@ static LRESULT CALLBACK MenuHookProc(int code, WPARAM w, LPARAM l) {
             int pos = MenuItemFromPoint(NULL, g_selMenu, m->pt);
             if (pos >= 0 && MidFromItem(g_selMenu, pos, m->pt)) return 1;
         }
+        if (m->message == WM_RBUTTONUP) Log(L"меню: правый клик, меню=%p, вложенное=%d", (void *)g_selMenu, g_nested);
         if (m->message == WM_RBUTTONUP && g_selMenu) {
             int pos = MenuItemFromPoint(NULL, g_selMenu, m->pt);
+            if (pos < 0) { /* запасной способ: пункт под выделением */
+                int cnt = GetMenuItemCount(g_selMenu);
+                for (int i = 0; i < cnt; i++) if (GetMenuState(g_selMenu, (UINT)i, MF_BYPOSITION) & MF_HILITE) { pos = i; break; }
+            }
+            Log(L"меню: правый клик, позиция пункта=%d", pos);
             if (pos >= 0) {
                 CtxFromItem(g_selMenu, pos, m->pt);
                 return 1; /* правый клик не должен запускать пункт */
