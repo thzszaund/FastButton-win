@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.13.0"
+#define APPVER L"2.14.0"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -60,7 +60,8 @@ static HFONT g_font;
 static int g_dpi = 96;
 static wchar_t g_ini[MAX_PATH], g_dir[MAX_PATH];
 static COLORREF g_cust[16];
-static struct { int show, size, opacity, pos, dur, outw, bold; COLORREF col, outc; wchar_t font[64]; } g_ov; /* оверлей с номером рабочего стола */
+static struct { int show, size, opacity, pos, dur, outw, bold, showName, capSize, capPos; COLORREF col, outc; wchar_t font[64]; } g_ov;
+static wchar_t g_deskNames[512]; /* свои названия столов через «;» */ /* оверлей с номером рабочего стола */
 
 static MonBtn *g_mb[MAXMON];
 static int g_nmb;
@@ -80,7 +81,7 @@ static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keep
 static wchar_t g_excl[MAXLIST][64], g_remote[MAXLIST][64];
 static int g_nexcl, g_nremote;
 static HICON g_icon;
-static struct { int on, delay, bold, size, bgA, hl, titles; wchar_t font[64]; COLORREF fg, bg, hlc; } g_trayInfo; /* всплывающее окно у значка в трее */
+static struct { int on, delay, bold, size, bgA, hl, titles, nameMode; wchar_t font[64]; COLORREF fg, bg, hlc, hlFg; } g_trayInfo; /* всплывающее окно у значка в трее */
 static COLORREF g_trayBgN[8], g_trayFgN[8]; /* цвета значка в трее для столов 1..8 (дальше по кругу) */
 static int g_deskNum; /* номер текущего виртуального стола (0 = неизвестен) */
 static int g_inMenu, g_modal, g_debug;
@@ -401,6 +402,10 @@ static void LoadAll(void) {
     g_cfg.show = GetI(L"Options", L"ShowButtons", 1) ? 1 : 0;
     GetS(L"Options", L"TextEditor", L"", g_cfg.editor, MAX_PATH * 2);
     g_ov.show = GetI(L"DeskOverlay", L"Show", 1) ? 1 : 0;
+    g_ov.showName = GetI(L"DeskOverlay", L"ShowName", 1) ? 1 : 0;
+    g_ov.capSize = Clamp(GetI(L"DeskOverlay", L"NameSize", 40), 10, 400);
+    g_ov.capPos = Clamp(GetI(L"DeskOverlay", L"NamePosition", 0), 0, 10);
+    GetS(L"DeskNames", L"List", L"", g_deskNames, 512);
     GetS(L"DeskOverlay", L"Font", L"Segoe UI", g_ov.font, 64);
     g_ov.size = Clamp(GetI(L"DeskOverlay", L"Size", 120), 20, 600);
     g_ov.bold = GetI(L"DeskOverlay", L"Bold", 1) ? 1 : 0;
@@ -442,6 +447,8 @@ static void LoadAll(void) {
     g_trayInfo.hl = GetI(L"TrayInfo", L"HighlightCurrent", 1) ? 1 : 0;
     GetS(L"TrayInfo", L"HighlightColor", L"2B6CB0", b, 64); g_trayInfo.hlc = ParseColor(b, RGB(0x2B, 0x6C, 0xB0));
     g_trayInfo.titles = GetI(L"TrayInfo", L"ShowWindowTitles", 0) ? 1 : 0;
+    GetS(L"TrayInfo", L"HighlightTextColor", L"FFFFFF", b, 64); g_trayInfo.hlFg = ParseColor(b, RGB(255, 255, 255));
+    g_trayInfo.nameMode = Clamp(GetI(L"TrayInfo", L"NameMode", 1), 0, 2);
     {
         static const wchar_t *defBg[8] = { L"3399FF", L"2E9E4F", L"F28C28", L"D9435B", L"8E5BD9", L"1FA8A0", L"E05CA8", L"6B7280" };
         for (int i = 0; i < 8; i++) {
@@ -534,6 +541,8 @@ static void SaveCfg(void) {
     PutI(L"TrayInfo", L"HighlightCurrent", g_trayInfo.hl);
     PUTCOL(L"TrayInfo", L"HighlightColor", g_trayInfo.hlc);
     PutI(L"TrayInfo", L"ShowWindowTitles", g_trayInfo.titles);
+    PUTCOL(L"TrayInfo", L"HighlightTextColor", g_trayInfo.hlFg);
+    PutI(L"TrayInfo", L"NameMode", g_trayInfo.nameMode);
     for (int i = 0; i < 8; i++) {
         wchar_t kb[16], kf[16];
         _snwprintf(kb, 16, L"Bg%d", i + 1); _snwprintf(kf, 16, L"Fg%d", i + 1);
@@ -542,6 +551,10 @@ static void SaveCfg(void) {
     }
 #undef PUTCOL
     PutI(L"DeskOverlay", L"Show", g_ov.show);
+    PutI(L"DeskOverlay", L"ShowName", g_ov.showName);
+    PutI(L"DeskOverlay", L"NameSize", g_ov.capSize);
+    PutI(L"DeskOverlay", L"NamePosition", g_ov.capPos);
+    PutS(L"DeskNames", L"List", g_deskNames);
     PutS(L"DeskOverlay", L"Font", g_ov.font);
     PutI(L"DeskOverlay", L"Size", g_ov.size);
     PutI(L"DeskOverlay", L"Bold", g_ov.bold);
@@ -752,9 +765,24 @@ static int ReadCurDesk(GUID *g) {
 }
 
 /* ---------- переключение виртуальных столов по кругу + оверлей с номером ---------- */
+static int DeskName(int num, wchar_t *out, int n) { /* своё название стола №num; 0 если не задано */
+    const wchar_t *p = g_deskNames;
+    int i = 1;
+    out[0] = 0;
+    while (i < num) { p = wcschr(p, L';'); if (!p) return 0; p++; i++; }
+    const wchar_t *e = wcschr(p, L';');
+    int len = e ? (int)(e - p) : (int)wcslen(p);
+    if (len >= n) len = n - 1;
+    memcpy(out, p, (size_t)len * sizeof(wchar_t));
+    out[len] = 0;
+    Trim(out);
+    return out[0] != 0;
+}
 static void LocalizeFocus(MonBtn *b);
 static void DeskNumChanged(void);
 static int g_ovTick, g_ovNum;
+static wchar_t g_ovCap[128];
+static HWND g_ovCapWnd;
 static HWND g_ovWnd;
 static int DeskInfo(int *idx) { /* число столов и индекс текущего (из реестра); idx=-1 если не определён */
     BYTE ids[16 * 64];
@@ -794,10 +822,10 @@ static LRESULT CALLBACK OvProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         HBRUSH kb = CreateSolidBrush(key);
         FillRect(dc, &rc, kb);
         DeleteObject(kb);
-        wchar_t t[16];
-        _snwprintf(t, 16, L"%d", g_ovNum);
-        t[15] = 0;
-        HFONT f = CreateFontW(-S(g_ov.size), 0, 0, 0, g_ov.bold ? FW_BOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, g_ov.font);
+        int cap = (int)GetWindowLongPtrW(h, GWLP_USERDATA); /* 1 = окно с названием стола */
+        wchar_t t[128];
+        if (cap) cp(t, 128, g_ovCap); else { _snwprintf(t, 16, L"%d", g_ovNum); t[15] = 0; }
+        HFONT f = CreateFontW(-S(cap ? g_ov.capSize : g_ov.size), 0, 0, 0, g_ov.bold ? FW_BOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, g_ov.font);
         HFONT of = (HFONT)SelectObject(dc, f);
         SetBkMode(dc, TRANSPARENT);
         int pad = S(g_ov.outw) + S(6);
@@ -864,6 +892,42 @@ static void ShowDeskOverlay(int num) { /* num <= 0: показать номер 
     InvalidateRect(g_ovWnd, NULL, TRUE);
     UpdateWindow(g_ovWnd);
     SetTimer(g_ovWnd, 1, (UINT)g_ov.dur, NULL);
+    wchar_t nm[64];
+    if (g_ov.showName && DeskName(num, nm, 64)) { /* надпись с названием: свой размер шрифта и положение */
+        cp(g_ovCap, 128, nm);
+        if (!g_ovCapWnd) {
+            g_ovCapWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, L"CBOverlay", L"", WS_POPUP, 0, 0, 10, 10, NULL, NULL, g_hinst, NULL);
+            if (g_ovCapWnd) SetWindowLongPtrW(g_ovCapWnd, GWLP_USERDATA, 1);
+        }
+        if (g_ovCapWnd) {
+            HDC dc2 = GetDC(NULL);
+            HFONT f2 = CreateFontW(-S(g_ov.capSize), 0, 0, 0, g_ov.bold ? FW_BOLD : FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, g_ov.font);
+            HFONT of2 = (HFONT)SelectObject(dc2, f2);
+            SIZE sz2;
+            GetTextExtentPoint32W(dc2, nm, (int)wcslen(nm), &sz2);
+            SelectObject(dc2, of2);
+            DeleteObject(f2);
+            ReleaseDC(NULL, dc2);
+            int cw2 = sz2.cx + 2 * pad, ch2 = sz2.cy + 2 * pad;
+            if (cw2 > r.right - r.left) cw2 = r.right - r.left;
+            int cx2, cy2;
+            if (g_ov.capPos <= 1) { cx2 = x + w / 2 - cw2 / 2; cy2 = g_ov.capPos == 0 ? y + h : y - ch2; }
+            else {
+                int gp = g_ov.capPos - 2, gc = gp % 3, gr = gp / 3;
+                cx2 = gc == 0 ? r.left + mx : (gc == 1 ? (r.left + r.right - cw2) / 2 : r.right - cw2 - mx);
+                cy2 = gr == 0 ? r.top + my : (gr == 1 ? (r.top + r.bottom - ch2) / 2 : r.bottom - ch2 - my);
+            }
+            if (cx2 + cw2 > r.right) cx2 = r.right - cw2;
+            if (cx2 < r.left) cx2 = r.left;
+            if (cy2 + ch2 > r.bottom) cy2 = r.bottom - ch2;
+            if (cy2 < r.top) cy2 = r.top;
+            SetLayeredWindowAttributes(g_ovCapWnd, RGB(255, 0, 254), (BYTE)(g_ov.opacity * 255 / 100), LWA_COLORKEY | LWA_ALPHA);
+            SetWindowPos(g_ovCapWnd, HWND_TOPMOST, cx2, cy2, cw2, ch2, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            InvalidateRect(g_ovCapWnd, NULL, TRUE);
+            UpdateWindow(g_ovCapWnd);
+            SetTimer(g_ovCapWnd, 1, (UINT)g_ov.dur, NULL);
+        }
+    } else if (g_ovCapWnd) ShowWindow(g_ovCapWnd, SW_HIDE);
 }
 /* Ctrl+Win+стрелка как nircmd sendkeypress: keybd_event, скан-коды, короткие паузы */
 static void DeskKeys(WORD vk, int cnt) {
@@ -2077,7 +2141,14 @@ static void ShowTrayTip(int atCursor) {
     if (!ln) return;
     for (int d = 0; d < g_td.n; d++) {
         if (d > 0) { ln[nl].kind = 3; ln[nl++].desk = d; }
-        _snwprintf(ln[nl].t, 100, L"Рабочий стол %d:", d + 1); ln[nl].kind = 0; ln[nl++].desk = d;
+        {
+            wchar_t nm[64];
+            int hasN = g_trayInfo.nameMode && DeskName(d + 1, nm, 64);
+            if (hasN && g_trayInfo.nameMode == 1) _snwprintf(ln[nl].t, 100, L"%ls:", nm);
+            else if (hasN) _snwprintf(ln[nl].t, 100, L"%d \u2014 %ls:", d + 1, nm);
+            else _snwprintf(ln[nl].t, 100, L"Рабочий стол %d:", d + 1);
+            ln[nl].kind = 0; ln[nl++].desk = d;
+        }
         RuPlural(g_td.cnt[d], ln[nl].t, 100); ln[nl].kind = 1; ln[nl++].desk = d;
         if (g_trayInfo.titles) {
             for (int j = 0; j < g_td.tn[d]; j++) { _snwprintf(ln[nl].t, 100, L"  • %ls", g_td.t[d][j]); ln[nl].kind = 2; ln[nl++].desk = d; }
@@ -2117,10 +2188,11 @@ static void ShowTrayTip(int atCursor) {
     HBITMAP ob = (HBITMAP)SelectObject(dc, dib);
     /* фон по строкам: подсветка текущего стола или обычный */
     COLORREF *rowBg = (COLORREF *)malloc(sizeof(COLORREF) * (size_t)H);
-    for (int y = 0; y < H; y++) rowBg[y] = g_trayInfo.bg;
+    COLORREF *rowFg = (COLORREF *)malloc(sizeof(COLORREF) * (size_t)H);
+    for (int y = 0; y < H; y++) { rowBg[y] = g_trayInfo.bg; rowFg[y] = g_trayInfo.fg; }
     for (int i = 0; i < nl; i++)
         if (g_trayInfo.hl && ln[i].kind != 3 && ln[i].desk == g_td.cur)
-            for (int y = y0[i]; y < y0[i] + hh[i] && y < H; y++) rowBg[y] = g_trayInfo.hlc;
+            for (int y = y0[i]; y < y0[i] + hh[i] && y < H; y++) { rowBg[y] = g_trayInfo.hlc; rowFg[y] = g_trayInfo.hlFg; }
     for (int y = 0; y < H; y++) {
         COLORREF c = rowBg[y];
         DWORD px = (DWORD)(GetBValue(c) | (GetGValue(c) << 8) | (GetRValue(c) << 16));
@@ -2139,6 +2211,7 @@ static void ShowTrayTip(int atCursor) {
             continue;
         }
         HFONT of = (HFONT)SelectObject(dc, ln[i].kind == 2 ? fs : fm);
+        SetTextColor(dc, (g_trayInfo.hl && ln[i].desk == g_td.cur) ? g_trayInfo.hlFg : g_trayInfo.fg);
         RECT tr = { pad, y0[i], W - pad, y0[i] + hh[i] };
         DrawTextW(dc, ln[i].t, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(dc, of);
@@ -2146,9 +2219,9 @@ static void ShowTrayTip(int atCursor) {
     GdiFlush();
     /* прозрачность только у фона: по отклонению пикселя от фона находим долю цвета текста */
     float a = g_trayInfo.bgA / 100.0f;
-    int fR = GetRValue(g_trayInfo.fg), fG = GetGValue(g_trayInfo.fg), fB = GetBValue(g_trayInfo.fg);
     for (int y = 0; y < H; y++) {
-        COLORREF bc = rowBg[y];
+        COLORREF bc = rowBg[y], fc = rowFg[y];
+        int fR = GetRValue(fc), fG = GetGValue(fc), fB = GetBValue(fc);
         int bR = GetRValue(bc), bG = GetGValue(bc), bB = GetBValue(bc);
         int dR = fR - bR, dG = fG - bG, dB = fB - bB;
         int aR = abs(dR), aG = abs(dG), aB = abs(dB);
@@ -2199,6 +2272,7 @@ static void ShowTrayTip(int atCursor) {
     DeleteDC(dc);
     ReleaseDC(NULL, sdc);
     free(rowBg);
+    free(rowFg);
     free(ln);
 }
 static void TrayHover(void) { /* мышь над значком в трее */
@@ -3014,6 +3088,7 @@ typedef struct {
     HWND chAuto, chDebug, eEditor, cbMid;
     Act ta[3];
     HWND stTAct[3], chTDup;
+    HWND eNames, chOvName, eOvCapSize, cbOvCapPos, eTpHlFg, cbTpName;
     HWND chTip, eTpDelay, eTpFont, chTpBold, eTpSize, eTpFg, eTpBg, eTpA, chTpHl, eTpHl, chTpTitles;
     COLORREF tmpBg[8], tmpFg[8];
     int tsel;
@@ -3252,7 +3327,20 @@ static void PgDesk(SetDlg *s, HWND pg) {
         SendMessageW(s->cbOvPos, CB_SETCURSEL, g_ov.pos, 0);
     }
     Btn(pg, L"Применить и показать пример", 12, 340, 520, 30, 932, 0);
-    Lbl(pg, L"Действие «Следующий виртуальный рабочий стол (по кругу)» можно назначить на любую кнопку/жест на вкладке «Действия кнопки».", 12, 384, 760, 40);
+    Lbl(pg, L"Свои названия столов, через «;» по порядку (например: Левый;Правый). Пусто — без названий:", 12, 384, 780, 20);
+    s->eNames = Edt(pg, 12, 408, 600, 24, 933);
+    SetWindowTextW(s->eNames, g_deskNames);
+    s->chOvName = Chkbox(pg, L"Показывать название стола в оверлее (надпись со своим размером и положением)", 12, 440, 780, 934, g_ov.showName);
+    Lbl(pg, L"Размер шрифта надписи, px:", 12, 474, 260, 24);
+    s->eOvCapSize = Edt(pg, 280, 470, 90, 24, 935);
+    _snwprintf(b, 64, L"%d", g_ov.capSize); SetWindowTextW(s->eOvCapSize, b);
+    Lbl(pg, L"Положение надписи:", 12, 508, 260, 24);
+    s->cbOvCapPos = Mk(pg, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, 280, 504, 300, 280, 936);
+    {
+        static const wchar_t *cp2[] = { L"Под цифрой", L"Над цифрой", L"На экране: слева сверху", L"На экране: по центру сверху", L"На экране: справа сверху", L"На экране: слева по центру", L"На экране: по центру", L"На экране: справа по центру", L"На экране: слева снизу", L"На экране: по центру снизу", L"На экране: справа снизу" };
+        for (int i = 0; i < 11; i++) SendMessageW(s->cbOvCapPos, CB_ADDSTRING, 0, (LPARAM)cp2[i]);
+        SendMessageW(s->cbOvCapPos, CB_SETCURSEL, g_ov.capPos, 0);
+    }
 }
 static void PickOvColor(SetDlg *s, HWND owner, HWND ed, COLORREF def) {
     wchar_t b[32];
@@ -3360,7 +3448,15 @@ static void PgTip(SetDlg *s, HWND pg) {
     y += 34;
     s->chTpHl = Chkbox(pg, L"Подсвечивать текущий рабочий стол", 12, y, 500, 1000, g_trayInfo.hl);
     y += 30;
-    NumRow(pg, s, &s->eTpHl, L"Цвет подсветки:", y, 1001, 1002, g_trayInfo.hlc); y += 34;
+    NumRow(pg, s, &s->eTpHl, L"Цвет подсветки (фон):", y, 1001, 1002, g_trayInfo.hlc); y += 30;
+    NumRow(pg, s, &s->eTpHlFg, L"Цвет шрифта подсвеченного стола:", y, 1005, 1006, g_trayInfo.hlFg); y += 34;
+    Lbl(pg, L"Название стола:", 12, y + 3, 260, 20);
+    s->cbTpName = Mk(pg, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, 280, y, 300, 160, 1007);
+    SendMessageW(s->cbTpName, CB_ADDSTRING, 0, (LPARAM)L"Всегда «Рабочий стол N»");
+    SendMessageW(s->cbTpName, CB_ADDSTRING, 0, (LPARAM)L"Своё название (если задано)");
+    SendMessageW(s->cbTpName, CB_ADDSTRING, 0, (LPARAM)L"N — своё название");
+    SendMessageW(s->cbTpName, CB_SETCURSEL, g_trayInfo.nameMode, 0);
+    y += 34;
     s->chTpTitles = Chkbox(pg, L"Показывать названия окон (до 6 на каждом столе)", 12, y, 560, 1003, g_trayInfo.titles);
     y += 40;
     Btn(pg, L"Применить и показать пример", 12, y, 300, 30, 1004, 0);
@@ -3440,6 +3536,10 @@ static int SetApply(SetDlg *s) {
     {
         wchar_t b[64];
         g_ov.show = Chk(s->chOv);
+        GetWindowTextW(s->eNames, g_deskNames, 512); Trim(g_deskNames);
+        g_ov.showName = Chk(s->chOvName);
+        g_ov.capSize = EdI(s->eOvCapSize, 10, 400, g_ov.capSize);
+        { int cpz = (int)SendMessageW(s->cbOvCapPos, CB_GETCURSEL, 0, 0); if (cpz >= 0 && cpz <= 10) g_ov.capPos = cpz; }
         GetWindowTextW(s->eOvFont, g_ov.font, 64);
         Trim(g_ov.font);
         if (!g_ov.font[0]) cp(g_ov.font, 64, L"Segoe UI");
@@ -3489,6 +3589,8 @@ static int SetApply(SetDlg *s) {
         g_trayInfo.hl = Chk(s->chTpHl);
         GetWindowTextW(s->eTpHl, b, 32); g_trayInfo.hlc = ParseColor(b, g_trayInfo.hlc);
         g_trayInfo.titles = Chk(s->chTpTitles);
+        GetWindowTextW(s->eTpHlFg, b, 32); g_trayInfo.hlFg = ParseColor(b, g_trayInfo.hlFg);
+        { int nm2 = (int)SendMessageW(s->cbTpName, CB_GETCURSEL, 0, 0); if (nm2 >= 0 && nm2 <= 2) g_trayInfo.nameMode = nm2; }
     }
     { int mi = (int)SendMessageW(s->cbMid, CB_GETCURSEL, 0, 0); if (mi >= 0 && mi <= 6) g_cfg.midItem = mi; }
     if (Chk(s->chAuto) != AutoGet()) AutoSet(Chk(s->chAuto));
@@ -3557,6 +3659,7 @@ static void SetCmd(Dlg *d, int id, int code) {
     case 967: PickOvColor(s, d->h, s->eNFgH, g_cfg.numFgH); break;
     case 969: PickOvColor(s, d->h, s->eNBg, g_cfg.numBg); break;
     case 971: PickOvColor(s, d->h, s->eNBgH, g_cfg.numBgH); break;
+    case 1006: PickOvColor(s, d->h, s->eTpHlFg, g_trayInfo.hlFg); break;
     case 996: PickOvColor(s, d->h, s->eTpFg, g_trayInfo.fg); break;
     case 998: PickOvColor(s, d->h, s->eTpBg, g_trayInfo.bg); break;
     case 1002: PickOvColor(s, d->h, s->eTpHl, g_trayInfo.hlc); break;
