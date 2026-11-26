@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.15.1"
+#define APPVER L"2.16.0"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 4
@@ -4009,10 +4009,19 @@ static void ShellContextMenu(const wchar_t *path, POINT pt) { /* обычное 
     CoTaskMemFree(pidl);
 }
 static int g_pendCmd; /* команда контекстного меню, выбранная при открытом основном меню */
-static int g_ctxFail; /* вложенное контекстное меню не открылось: используем запасной путь */
 static int EntryIsCommand(int sec, int exists) { return sec == SEC_SCRIPT && !exists; } /* в «Скриптах и командах» это не файл, а команда */
-static int EntryCtxChoose(int sec, int idx, POINT pt) { /* контекстное меню пункта: набор зависит от раздела; возвращает команду */
-    int exists = 0;
+#define CP_MAX 24
+typedef struct { int id; wchar_t text[96]; UINT flags; } CtxItem; /* flags: 0, MF_GRAYED или MF_SEPARATOR */
+static void CtxAdd(CtxItem *it, int *n, int id, const wchar_t *t, UINT fl) {
+    if (*n >= CP_MAX) return;
+    if ((fl & MF_SEPARATOR) && (*n == 0 || (it[*n - 1].flags & MF_SEPARATOR))) return; /* без пустых и двойных разделителей */
+    it[*n].id = id;
+    cp(it[*n].text, 96, t ? t : L"");
+    it[*n].flags = fl;
+    (*n)++;
+}
+static int EntryCtxList(int sec, int idx, CtxItem *it) { /* набор пунктов зависит от раздела; возвращает число пунктов */
+    int exists = 0, n = 0;
     wchar_t path[1100];
     if (sec < 0 || sec >= NSEC || idx < 0 || idx >= g_cnt[sec]) return 0;
     Entry *e = &g_ent[sec][idx];
@@ -4021,39 +4030,198 @@ static int EntryCtxChoose(int sec, int idx, POINT pt) { /* контекстно�
     int cmdMode = EntryIsCommand(sec, exists);
     int editable = exists && !isDir && (sec == SEC_SCRIPT || sec == SEC_FILES || IsScriptExt(path));
     UINT gr = exists ? 0 : MF_GRAYED;
-    HMENU m = CreatePopupMenu();
-    const wchar_t *openLbl = sec == SEC_FOLDER ? L"Открыть папку" : (sec == SEC_FILES ? L"Открыть" : L"Запустить");
-    AppendMenuW(m, MF_STRING, CX_OPEN, openLbl);
-    if (sec == SEC_PROG || sec == SEC_SCRIPT) AppendMenuW(m, MF_STRING | (cmdMode ? 0 : gr), CX_ADMIN, L"Запустить от имени администратора");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    CtxAdd(it, &n, CX_OPEN, sec == SEC_FOLDER ? L"Открыть папку" : (sec == SEC_FILES ? L"Открыть" : L"Запустить"), 0);
+    if (sec == SEC_PROG || sec == SEC_SCRIPT) CtxAdd(it, &n, CX_ADMIN, L"Запустить от имени администратора", cmdMode ? 0 : gr);
+    CtxAdd(it, &n, 0, NULL, MF_SEPARATOR);
     if (!cmdMode) {
-        AppendMenuW(m, MF_STRING | gr, CX_SHELL, L"Контекстное меню Explorer");
-        AppendMenuW(m, MF_STRING | gr, CX_REVEAL, sec == SEC_FOLDER ? L"Показать папку в проводнике" : (sec == SEC_PROG ? L"Показать программу в папке" : (sec == SEC_SCRIPT ? L"Показать скрипт в папке" : L"Показать файл в папке")));
-        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(m, MF_STRING, CX_COPYPATH, (sec == SEC_PROG || sec == SEC_SCRIPT) ? L"Скопировать полный путь (с аргументами)" : L"Скопировать полный путь");
-        AppendMenuW(m, MF_STRING, CX_COPYNAME, sec == SEC_FOLDER ? L"Скопировать имя папки" : (sec == SEC_PROG ? L"Скопировать имя программы" : (sec == SEC_SCRIPT ? L"Скопировать имя скрипта" : L"Скопировать имя файла")));
-        AppendMenuW(m, MF_STRING | gr, CX_COPYFILE, sec == SEC_FOLDER ? L"Скопировать папку в буфер" : (sec == SEC_PROG ? L"Скопировать программу в буфер" : (sec == SEC_SCRIPT ? L"Скопировать скрипт в буфер" : L"Скопировать файл в буфер")));
-    } else {
-        AppendMenuW(m, MF_STRING, CX_COPYCMD, L"Скопировать команду");
+        CtxAdd(it, &n, CX_SHELL, L"Контекстное меню Explorer", gr);
+        CtxAdd(it, &n, CX_REVEAL, sec == SEC_FOLDER ? L"Показать папку в проводнике" : (sec == SEC_PROG ? L"Показать программу в папке" : (sec == SEC_SCRIPT ? L"Показать скрипт в папке" : L"Показать файл в папке")), gr);
+        CtxAdd(it, &n, 0, NULL, MF_SEPARATOR);
+        CtxAdd(it, &n, CX_COPYPATH, (sec == SEC_PROG || sec == SEC_SCRIPT) ? L"Скопировать полный путь (с аргументами)" : L"Скопировать полный путь", 0);
+        CtxAdd(it, &n, CX_COPYNAME, sec == SEC_FOLDER ? L"Скопировать имя папки" : (sec == SEC_PROG ? L"Скопировать имя программы" : (sec == SEC_SCRIPT ? L"Скопировать имя скрипта" : L"Скопировать имя файла")), 0);
+        CtxAdd(it, &n, CX_COPYFILE, sec == SEC_FOLDER ? L"Скопировать папку в буфер" : (sec == SEC_PROG ? L"Скопировать программу в буфер" : (sec == SEC_SCRIPT ? L"Скопировать скрипт в буфер" : L"Скопировать файл в буфер")), gr);
+    } else CtxAdd(it, &n, CX_COPYCMD, L"Скопировать команду", 0);
+    CtxAdd(it, &n, 0, NULL, MF_SEPARATOR);
+    if (editable) CtxAdd(it, &n, CX_EDIT, g_cfg.editor[0] ? L"Открыть в текстовом редакторе" : L"Открыть в блокноте", 0);
+    if (!cmdMode) CtxAdd(it, &n, CX_PROPS, L"Свойства", gr);
+    CtxAdd(it, &n, 0, NULL, MF_SEPARATOR);
+    CtxAdd(it, &n, CX_RENAME, L"Переименовать пункт меню", 0);
+    return n;
+}
+static int EntryCtxChoose(int sec, int idx, POINT pt) { /* системное меню (когда основное меню уже закрыто) */
+    CtxItem it[CP_MAX];
+    int n = EntryCtxList(sec, idx, it);
+    if (!n) return 0;
+    HMENU m = CreatePopupMenu();
+    for (int i = 0; i < n; i++) {
+        if (it[i].flags & MF_SEPARATOR) AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        else AppendMenuW(m, MF_STRING | it[i].flags, (UINT_PTR)it[i].id, it[i].text);
     }
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    if (editable) AppendMenuW(m, MF_STRING, CX_EDIT, g_cfg.editor[0] ? L"Открыть в текстовом редакторе" : L"Открыть в блокноте");
-    if (!cmdMode) AppendMenuW(m, MF_STRING | gr, CX_PROPS, L"Свойства");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, CX_RENAME, L"Переименовать пункт меню");
     g_inMenu = 1;
-    if (!g_nested) SetForegroundWindow(g_ctl);
-    SetLastError(0);
+    SetForegroundWindow(g_ctl);
     int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_ctl, NULL);
-    DWORD err = GetLastError();
-    if (!cmd && err && g_nested) {
-        g_ctxFail = 1;
-        Log(L"контекстное меню пункта: вложенный TrackPopupMenu не открылся (ошибка %lu), использую запасной путь", (unsigned long)err);
-    } else Log(L"контекстное меню пункта: раздел %d, пункт %d, команда %d, вложенное=%d", sec, idx, cmd, g_nested);
     PostMessageW(g_ctl, WM_NULL, 0, 0);
-    if (!g_nested) g_inMenu = 0;
+    g_inMenu = 0;
     DestroyMenu(m);
     return cmd;
+}
+/* ---- собственное контекстное меню поверх открытого системного меню ----
+   Windows не разрешает второе системное меню в этом потоке (ошибка 1446), поэтому рисуем своё окно,
+   а мышь и клавиши забираем из перехватчика меню (WH_MSGFILTER). Основное меню остаётся открытым. */
+static struct { HWND h; int n, hot, open, eatUp, sec, idx; CtxItem it[CP_MAX]; int y[CP_MAX], hgt[CP_MAX]; int W, H; RECT rc; POINT pt; HFONT font; } g_cp;
+static void CpRepaint(void) { if (g_cp.h) { InvalidateRect(g_cp.h, NULL, FALSE); UpdateWindow(g_cp.h); } }
+static void CpClose(void) {
+    if (g_cp.h && g_cp.open) ShowWindow(g_cp.h, SW_HIDE);
+    g_cp.open = 0;
+    if (g_cp.font) { DeleteObject(g_cp.font); g_cp.font = NULL; }
+}
+static LRESULT CALLBACK CpProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC pdc = BeginPaint(h, &ps);
+        HDC dc = CreateCompatibleDC(pdc);
+        HBITMAP bmp = CreateCompatibleBitmap(pdc, g_cp.W, g_cp.H);
+        HBITMAP ob = (HBITMAP)SelectObject(dc, bmp);
+        RECT rc = { 0, 0, g_cp.W, g_cp.H };
+        FillRect(dc, &rc, GetSysColorBrush(COLOR_MENU));
+        FrameRect(dc, &rc, GetSysColorBrush(COLOR_3DSHADOW));
+        HFONT of = g_cp.font ? (HFONT)SelectObject(dc, g_cp.font) : NULL;
+        SetBkMode(dc, TRANSPARENT);
+        for (int i = 0; i < g_cp.n; i++) {
+            RECT ir = { 2, g_cp.y[i], g_cp.W - 2, g_cp.y[i] + g_cp.hgt[i] };
+            if (g_cp.it[i].flags & MF_SEPARATOR) {
+                HPEN pen = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_3DSHADOW));
+                HPEN op = (HPEN)SelectObject(dc, pen);
+                MoveToEx(dc, S(8), (ir.top + ir.bottom) / 2, NULL);
+                LineTo(dc, g_cp.W - S(8), (ir.top + ir.bottom) / 2);
+                SelectObject(dc, op);
+                DeleteObject(pen);
+                continue;
+            }
+            int dis = (g_cp.it[i].flags & MF_GRAYED) != 0, hot = i == g_cp.hot && !dis;
+            if (hot) FillRect(dc, &ir, GetSysColorBrush(COLOR_HIGHLIGHT));
+            SetTextColor(dc, dis ? GetSysColor(COLOR_GRAYTEXT) : (hot ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_MENUTEXT)));
+            RECT tr = { ir.left + S(18), ir.top, ir.right - S(10), ir.bottom };
+            DrawTextW(dc, g_cp.it[i].text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
+        if (of) SelectObject(dc, of);
+        BitBlt(pdc, 0, 0, g_cp.W, g_cp.H, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, ob);
+        DeleteObject(bmp);
+        DeleteDC(dc);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void CpShow(int sec, int idx, POINT pt, const CtxItem *it, int n) {
+    NONCLIENTMETRICSW ncm;
+    memset(&ncm, 0, sizeof ncm);
+    ncm.cbSize = sizeof ncm;
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
+    if (g_cp.font) DeleteObject(g_cp.font);
+    g_cp.font = CreateFontIndirectW(&ncm.lfMenuFont);
+    g_cp.n = n;
+    g_cp.sec = sec;
+    g_cp.idx = idx;
+    g_cp.pt = pt;
+    g_cp.hot = -1;
+    memcpy(g_cp.it, it, sizeof(CtxItem) * (size_t)n);
+    HDC dc = GetDC(NULL);
+    HFONT of = (HFONT)SelectObject(dc, g_cp.font);
+    TEXTMETRICW tm;
+    GetTextMetricsW(dc, &tm);
+    int maxw = 0, y = 2;
+    for (int i = 0; i < n; i++) {
+        if (it[i].flags & MF_SEPARATOR) g_cp.hgt[i] = S(9);
+        else {
+            SIZE sz;
+            GetTextExtentPoint32W(dc, it[i].text, (int)wcslen(it[i].text), &sz);
+            if (sz.cx > maxw) maxw = sz.cx;
+            g_cp.hgt[i] = tm.tmHeight + S(10);
+        }
+        g_cp.y[i] = y;
+        y += g_cp.hgt[i];
+    }
+    SelectObject(dc, of);
+    ReleaseDC(NULL, dc);
+    g_cp.W = maxw + S(18) + S(10) + 4;
+    g_cp.H = y + 2;
+    MONITORINFO mi;
+    mi.cbSize = sizeof mi;
+    GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
+    int x = pt.x, yy = pt.y;
+    if (x + g_cp.W > mi.rcWork.right) x = mi.rcWork.right - g_cp.W;
+    if (yy + g_cp.H > mi.rcWork.bottom) yy = mi.rcWork.bottom - g_cp.H;
+    if (x < mi.rcWork.left) x = mi.rcWork.left;
+    if (yy < mi.rcWork.top) yy = mi.rcWork.top;
+    g_cp.rc.left = x; g_cp.rc.top = yy; g_cp.rc.right = x + g_cp.W; g_cp.rc.bottom = yy + g_cp.H;
+    if (!g_cp.h) g_cp.h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"CBCtxPop", L"", WS_POPUP, 0, 0, 10, 10, NULL, NULL, g_hinst, NULL);
+    if (!g_cp.h) return;
+    SetWindowPos(g_cp.h, HWND_TOPMOST, x, yy, g_cp.W, g_cp.H, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    g_cp.open = 1;
+    g_cp.eatUp = 0;
+    CpRepaint();
+}
+static void CpHover(POINT p) {
+    int hot = -1, ly = p.y - g_cp.rc.top;
+    for (int i = 0; i < g_cp.n; i++)
+        if (!(g_cp.it[i].flags & (MF_SEPARATOR | MF_GRAYED)) && ly >= g_cp.y[i] && ly < g_cp.y[i] + g_cp.hgt[i]) { hot = i; break; }
+    if (hot != g_cp.hot) { g_cp.hot = hot; CpRepaint(); }
+}
+static void CpMove(int d) { /* клавиши вверх/вниз */
+    int i = g_cp.hot;
+    for (int k = 0; k < g_cp.n; k++) {
+        i = (i + d + g_cp.n) % g_cp.n;
+        if (i < 0) i = 0;
+        if (!(g_cp.it[i].flags & (MF_SEPARATOR | MF_GRAYED))) { g_cp.hot = i; CpRepaint(); return; }
+    }
+}
+static void CpExec(void) { /* выбранную команду выполним после закрытия основного меню */
+    if (g_cp.hot < 0) return;
+    int id = g_cp.it[g_cp.hot].id;
+    g_ctxSec = g_cp.sec;
+    g_ctxIdx = g_cp.idx;
+    g_ctxPt = g_cp.pt;
+    g_pendCmd = id;
+    CpClose();
+    EndMenu();
+}
+static int CpHook(const MSG *m) { /* 1 = сообщение забрано нашим меню */
+    UINT t = m->message;
+    if (!g_cp.open) {
+        if (g_cp.eatUp && (t == WM_LBUTTONUP || t == WM_RBUTTONUP || t == WM_MBUTTONUP)) { g_cp.eatUp = 0; return 1; }
+        return 0;
+    }
+    int inside = PtInRect(&g_cp.rc, m->pt);
+    if (t >= WM_KEYFIRST && t <= WM_KEYLAST) {
+        if (t == WM_KEYDOWN || t == WM_SYSKEYDOWN) {
+            if (m->wParam == VK_ESCAPE) CpClose();
+            else if (m->wParam == VK_DOWN) CpMove(1);
+            else if (m->wParam == VK_UP) CpMove(-1);
+            else if (m->wParam == VK_RETURN) CpExec();
+        }
+        return 1;
+    }
+    switch (t) {
+    case WM_MOUSEMOVE:
+        if (inside) { CpHover(m->pt); return 1; }
+        if (g_cp.hot >= 0) { g_cp.hot = -1; CpRepaint(); }
+        return 0;
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:
+        if (!inside) { CpClose(); g_cp.eatUp = 1; }
+        return 1;
+    case WM_LBUTTONUP:
+        if (inside) { CpHover(m->pt); CpExec(); }
+        return 1;
+    case WM_RBUTTONUP: case WM_MBUTTONUP:
+        return 1;
+    }
+    return 0;
 }
 static void EntryCtxRun(int sec, int idx, POINT pt, int cmd) { /* выполнить выбранную команду */
     int exists = 0;
@@ -4131,34 +4299,17 @@ static void ShowEntryContext(void) { /* после закрытия основн
     EntryCtxRun(sec, idx, pt, cmd);
 }
 /* правый клик по пункту нашего меню: контекстное меню поверх открытого меню, которое остаётся на экране */
-static int CtxFromItem(HMENU hm, int pos, POINT pt) { /* 1 = клик обработан (пункт — файл/папка) */
-    if (!hm || pos < 0 || g_nested) return 0;
+static int CtxFromItem(HMENU hm, int pos, POINT pt) { /* 1 = клик обработан (пункт — файл/папка/команда) */
+    if (!hm || pos < 0) return 0;
     UINT id = GetMenuItemID(hm, pos);
     if (id < ID_ENT0 || id >= ID_ENT0 + NSEC * MAXE) return 0;
     int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
-    wchar_t tp[1100];
-    int ex = 0;
-    if (idx >= g_cnt[sec] || !EntryTarget(&g_ent[sec][idx], tp, 1100, &ex)) return 0;
+    CtxItem it[CP_MAX];
+    int n = EntryCtxList(sec, idx, it);
+    if (!n) return 0;
     TipHide();
-    g_nested = 1;
-    int cmd = EntryCtxChoose(sec, idx, pt);
-    g_nested = 0;
-    if (g_ctxFail) { /* поверх открытого меню не получилось: закрываем основное и показываем контекстное после него */
-        g_ctxFail = 0;
-        g_ctxSec = sec;
-        g_ctxIdx = idx;
-        g_ctxPt = pt;
-        g_pendCmd = 0;
-        EndMenu();
-        return 1;
-    }
-    if (cmd > 0) { /* команду выполним после закрытия основного меню */
-        g_ctxSec = sec;
-        g_ctxIdx = idx;
-        g_ctxPt = pt;
-        g_pendCmd = cmd;
-        EndMenu();
-    }
+    CpShow(sec, idx, pt, it, n);
+    Log(L"контекстное меню пункта: раздел %d, пункт %d, собственное окно (%d пунктов)", sec, idx, n);
     return 1;
 }
 static int MidFromItem(HMENU hm, int pos, POINT pt) { /* средняя кнопка на пункте: действие из настроек, выполняется после закрытия меню */
@@ -4192,6 +4343,7 @@ static void OnMenuRButtonUp(int pos, HMENU hm) { /* WM_MENURBUTTONUP: запас
 static LRESULT CALLBACK MenuHookProc(int code, WPARAM w, LPARAM l) {
     if (code == MSGF_MENU) {
         MSG *m = (MSG *)l;
+        if (CpHook(m)) return 1;
         if (m->message == WM_MBUTTONUP && g_selMenu && !g_nested) {
             int pos = MenuItemFromPoint(NULL, g_selMenu, m->pt);
             if (pos >= 0 && MidFromItem(g_selMenu, pos, m->pt)) return 1;
@@ -4216,10 +4368,13 @@ static int TrackWithHook(HWND owner, HMENU m, POINT pt) {
     g_ctxSec = -1;
     g_pendCmd = 0;
     g_nested = 0;
+    g_cp.open = 0;
+    g_cp.eatUp = 0;
     g_selMenu = NULL;
     g_mhook = SetWindowsHookExW(WH_MSGFILTER, MenuHookProc, NULL, GetCurrentThreadId());
     int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD, pt.x, pt.y, 0, owner, NULL); /* без TPM_RIGHTBUTTON: правый клик пункт не запускает */
     if (g_mhook) { UnhookWindowsHookEx(g_mhook); g_mhook = NULL; }
+    CpClose();
     PostMessageW(owner, WM_NULL, 0, 0);
     return cmd;
 }
@@ -4462,6 +4617,10 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
     RegisterClassExW(&wc);
     wc.lpfnWndProc = TipProc;
     wc.lpszClassName = L"CBTrayTip";
+    RegisterClassExW(&wc);
+    wc.lpfnWndProc = CpProc;
+    wc.lpszClassName = L"CBCtxPop";
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     RegisterClassExW(&wc);
     memset(&wc, 0, sizeof wc);
     wc.cbSize = sizeof wc;
