@@ -26,12 +26,12 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.16.0"
+#define APPVER L"2.17.0"
 #define IDI_APP 100
 #define MAXE 300
-#define NSEC 4
+#define NSEC 5
 #define ID_ENT0 1000
-enum { SEC_PROG = 0, SEC_SCRIPT = 1, SEC_FOLDER = 2, SEC_FILES = 3 };
+enum { SEC_PROG = 0, SEC_SCRIPT = 1, SEC_FOLDER = 2, SEC_FILES = 3, SEC_BOOK = 4 };
 #define MAXD 7
 #define MAXMON 8
 #define MAXLIST 64
@@ -66,7 +66,12 @@ static wchar_t g_deskNames[512]; /* свои названия столов че�
 static MonBtn *g_mb[MAXMON];
 static int g_nmb;
 
-static Entry g_ent[NSEC][MAXE]; /* три раздела меню: Программы, Скрипты и команды, Папки */
+static Entry g_ent[NSEC][MAXE]; /* разделы меню: Программы, Скрипты и команды, Папки, Файлы, Закладки */
+typedef struct { wchar_t name[80], path[520]; } Browser;
+static Browser g_br[48]; /* все браузеры: сначала найденные в системе, затем свои (портабельные) */
+static int g_nbr, g_nbrInst;
+static Browser g_brMan[16]; /* свои (портабельные) браузеры из настроек */
+static int g_nbrMan;
 static int g_cnt[NSEC];
 static int g_cur;               /* раздел, с которым сейчас работают функции редактора */
 #define g_e g_ent[g_cur]
@@ -77,7 +82,7 @@ static HTREEITEM g_htis[NSEC][MAXE];
 #define g_hti g_htis[g_cur]
 static Act g_click, g_dbl, g_mid;
 static Act g_tclick, g_tdbl, g_tmid; /* действия на клики по значку в трее */
-static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; int midItem; int content, numBold, numScale, trayNum, trayBold, trayDup, trayByDesk; wchar_t numFont[64], trayFont[64]; COLORREF numFg, numFgH, numBg, numBgH, trayFg, trayBg; } g_cfg; /* content: 0 цвет, 1 иконка, 2 номер стола */
+static struct { int size, opacity, hover, shape, localKeys, pinTop, pinAll, keepTop, raisePinned, show; COLORREF color; wchar_t icon[MAX_PATH]; wchar_t editor[MAX_PATH * 2]; int midItem; wchar_t bookBrowser[520]; int content, numBold, numScale, trayNum, trayBold, trayDup, trayByDesk; wchar_t numFont[64], trayFont[64]; COLORREF numFg, numFgH, numBg, numBgH, trayFg, trayBg; } g_cfg; /* content: 0 цвет, 1 иконка, 2 номер стола */
 static wchar_t g_excl[MAXLIST][64], g_remote[MAXLIST][64];
 static int g_nexcl, g_nremote;
 static HICON g_icon;
@@ -240,7 +245,7 @@ static void SaveList(const wchar_t *sec, wchar_t (*arr)[64], int n) {
 }
 
 /* ---------- разделы меню (Программы / Скрипты / Папки): хранение в ini ---------- */
-static const wchar_t *g_secName[NSEC] = { L"Programs", L"Scripts", L"Folders", L"Files" };
+static const wchar_t *g_secName[NSEC] = { L"Programs", L"Scripts", L"Folders", L"Files", L"Bookmarks" };
 static wchar_t g_line[7000];
 
 static void EscCat(wchar_t *dst, size_t n, const wchar_t *s) {
@@ -423,6 +428,14 @@ static void LoadAll(void) {
     g_cfg.color = ParseColor(b, RGB(0x33, 0x99, 0xFF));
     GetS(L"Button", L"Icon", L"", g_cfg.icon, MAX_PATH);
     g_cfg.content = Clamp(GetI(L"Button", L"Content", g_cfg.icon[0] ? 1 : 0), 0, 2);
+    GetS(L"Bookmarks", L"DefaultBrowser", L"", g_cfg.bookBrowser, 520);
+    g_nbrMan = Clamp(GetI(L"Browsers", L"Count", 0), 0, 16);
+    for (int i = 0; i < g_nbrMan; i++) {
+        wchar_t kn[16], kp[16];
+        _snwprintf(kn, 16, L"Name%d", i + 1); _snwprintf(kp, 16, L"Path%d", i + 1);
+        GetS(L"Browsers", kn, L"", g_brMan[i].name, 80);
+        GetS(L"Browsers", kp, L"", g_brMan[i].path, 520);
+    }
     GetS(L"NumButton", L"Font", L"Segoe UI", g_cfg.numFont, 64);
     g_cfg.numBold = GetI(L"NumButton", L"Bold", 1) ? 1 : 0;
     g_cfg.numScale = Clamp(GetI(L"NumButton", L"ScalePercent", 75), 20, 100);
@@ -516,6 +529,14 @@ static void SaveCfg(void) {
     PutS(L"Options", L"TextEditor", g_cfg.editor);
     PutI(L"Options", L"MenuMiddleClick", g_cfg.midItem);
     PutI(L"Button", L"Content", g_cfg.content);
+    PutS(L"Bookmarks", L"DefaultBrowser", g_cfg.bookBrowser);
+    PutI(L"Browsers", L"Count", g_nbrMan);
+    for (int i = 0; i < g_nbrMan; i++) {
+        wchar_t kn[16], kp[16];
+        _snwprintf(kn, 16, L"Name%d", i + 1); _snwprintf(kp, 16, L"Path%d", i + 1);
+        PutS(L"Browsers", kn, g_brMan[i].name);
+        PutS(L"Browsers", kp, g_brMan[i].path);
+    }
     PutS(L"NumButton", L"Font", g_cfg.numFont);
     PutI(L"NumButton", L"Bold", g_cfg.numBold);
     PutI(L"NumButton", L"ScalePercent", g_cfg.numScale);
@@ -1530,11 +1551,115 @@ static void RunFileEntry(const Entry *e) {
     if (IsScriptExt(path)) { OpenInEditor(path); return; }   /* скрипты из «Файлов» открываем в редакторе, а не запускаем */
     ShellExecuteW(NULL, L"open", path, NULL, NULL, SW_SHOWNORMAL);
 }
+/* ---------- закладки: браузеры и открытие ссылок ---------- */
+static void ExeFromCmd(const wchar_t *cmd, wchar_t *out, int n) { /* путь к exe из строки команды реестра */
+    wchar_t t[1100];
+    out[0] = 0;
+    ExpandEnvironmentStringsW(cmd, t, 1100);
+    wchar_t *p = t;
+    while (*p == L' ') p++;
+    if (*p == L'"') {
+        p++;
+        wchar_t *q = wcschr(p, L'"');
+        if (q) *q = 0;
+    } else {
+        wchar_t low[1100];
+        cp(low, 1100, p);
+        _wcslwr(low);
+        wchar_t *x = wcsstr(low, L".exe");
+        if (x) p[(x - low) + 4] = 0;
+        else { wchar_t *sp = wcschr(p, L' '); if (sp) *sp = 0; }
+    }
+    cp(out, (size_t)n, p);
+}
+static void DetectBrowsers(void) { /* установленные браузеры из реестра (StartMenuInternet) */
+    static const HKEY roots[3] = { HKEY_LOCAL_MACHINE, HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER };
+    static const wchar_t *const paths[3] = { L"SOFTWARE\\Clients\\StartMenuInternet", L"SOFTWARE\\WOW6432Node\\Clients\\StartMenuInternet", L"SOFTWARE\\Clients\\StartMenuInternet" };
+    g_nbr = 0;
+    for (int r = 0; r < 3; r++) {
+        HKEY k;
+        if (RegOpenKeyExW(roots[r], paths[r], 0, KEY_READ, &k) != ERROR_SUCCESS) continue;
+        wchar_t sub[256];
+        for (DWORD i = 0; ; i++) {
+            DWORD sl = 256;
+            if (RegEnumKeyExW(k, i, sub, &sl, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+            HKEY ks;
+            wchar_t name[160] = L"", cmd[1100] = L"", path[520] = L"", kp[400];
+            if (RegOpenKeyExW(k, sub, 0, KEY_READ, &ks) == ERROR_SUCCESS) {
+                DWORD sz = sizeof name;
+                RegQueryValueExW(ks, NULL, NULL, NULL, (BYTE *)name, &sz);
+                RegCloseKey(ks);
+            }
+            _snwprintf(kp, 400, L"%ls\\shell\\open\\command", sub);
+            kp[399] = 0;
+            if (RegOpenKeyExW(k, kp, 0, KEY_READ, &ks) == ERROR_SUCCESS) {
+                DWORD sz = sizeof cmd;
+                RegQueryValueExW(ks, NULL, NULL, NULL, (BYTE *)cmd, &sz);
+                RegCloseKey(ks);
+            }
+            ExeFromCmd(cmd, path, 520);
+            if (!path[0] || GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) continue;
+            if (!name[0]) cp(name, WSZ(name), sub);
+            int dup = 0;
+            for (int j = 0; j < g_nbr; j++) if (!_wcsicmp(g_br[j].path, path)) dup = 1;
+            if (dup || g_nbr >= 32) continue;
+            cp(g_br[g_nbr].name, 80, name);
+            cp(g_br[g_nbr].path, 520, path);
+            g_nbr++;
+        }
+        RegCloseKey(k);
+    }
+    g_nbrInst = g_nbr;
+}
+static void RebuildBrowsers(int redetect) { /* найденные + свои */
+    if (redetect || !g_nbrInst) DetectBrowsers();
+    g_nbr = g_nbrInst;
+    for (int i = 0; i < g_nbrMan && g_nbr < 48; i++) {
+        if (!g_brMan[i].path[0]) continue;
+        cp(g_br[g_nbr].name, 80, g_brMan[i].name[0] ? g_brMan[i].name : L"Браузер");
+        cp(g_br[g_nbr].path, 520, g_brMan[i].path);
+        g_nbr++;
+    }
+}
+static void NormUrl(const wchar_t *in, wchar_t *out, int n) { /* без схемы — добавляем https:// */
+    wchar_t t[1100];
+    cp(t, 1100, in ? in : L"");
+    Trim(t);
+    if (t[0] && !wcsstr(t, L"://") && _wcsnicmp(t, L"mailto:", 7) && _wcsnicmp(t, L"file:", 5) && _wcsnicmp(t, L"about:", 6) && _wcsnicmp(t, L"javascript:", 11))
+        _snwprintf(out, (size_t)n, L"https://%ls", t);
+    else cp(out, (size_t)n, t);
+    out[n - 1] = 0;
+}
+static void OpenUrlIn(const wchar_t *url, const wchar_t *browser, const wchar_t *extra) {
+    wchar_t u[1100];
+    NormUrl(url, u, 1100);
+    if (!u[0]) return;
+    if (!browser || !browser[0]) { ShellExecuteW(NULL, L"open", u, NULL, NULL, SW_SHOWNORMAL); return; }
+    wchar_t br[1100], par[2500], ex[600];
+    ExpandEnvironmentStringsW(browser, br, 1100);
+    ExpandEnvironmentStringsW(extra ? extra : L"", ex, 600);
+    Trim(ex);
+    if (ex[0]) _snwprintf(par, 2500, L"%ls \"%ls\"", ex, u); else _snwprintf(par, 2500, L"\"%ls\"", u);
+    par[2499] = 0;
+    HINSTANCE r = ShellExecuteW(NULL, L"open", br, par, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)r <= 32) ShellExecuteW(NULL, L"open", u, NULL, NULL, SW_SHOWNORMAL); /* браузер не запустился: откроем обычным способом */
+}
+static void RunBookmark(const Entry *e) { OpenUrlIn(e->action, e->interp[0] ? e->interp : g_cfg.bookBrowser, e->args); }
+static void FillBrowserCombo(HWND cb, const wchar_t *sel, int withDefault) { /* список браузеров; индекс 0 — «по умолчанию» */
+    int cur = 0;
+    if (withDefault) SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"По умолчанию (выбирается на вкладке «Браузеры»)");
+    for (int i = 0; i < g_nbr; i++) {
+        SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)g_br[i].name);
+        if (sel && sel[0] && !_wcsicmp(g_br[i].path, sel)) cur = i + (withDefault ? 1 : 0);
+    }
+    SendMessageW(cb, CB_SETCURSEL, cur, 0);
+}
 static void RunEntry(int sec, int idx, MonBtn *b) {
     Entry *e = &g_ent[sec][idx];
     if (sec == SEC_SCRIPT) RunScript(e);
     else if (sec == SEC_FOLDER) RunFolder(e);
     else if (sec == SEC_FILES) RunFileEntry(e);
+    else if (sec == SEC_BOOK) RunBookmark(e);
     else RunSpec(e->action, e->args, b);
 }
 
@@ -1691,7 +1816,7 @@ static HICON StockIconFor(const wchar_t *action) { /* значки для вст
 static HBITMAP EntryBmp(const Entry *e, int sec) {
     if (e->type == 2) return NULL;
     wchar_t key[900];
-    _snwprintf(key, 900, L"%d|%d|%ls|%ls", sec, e->type, e->icon, e->type == 1 ? L"" : e->action);
+    _snwprintf(key, 900, L"%d|%d|%ls|%ls", sec, e->type, e->icon, (e->type == 1 || sec == SEC_BOOK) ? L"" : e->action);
     key[899] = 0;
     for (int i = 0; i < g_nic; i++) if (!wcscmp(g_ic[i].key, key)) return g_ic[i].bmp;
     if (g_nic >= ICACHE_MAX) return NULL;
@@ -1704,6 +1829,10 @@ static HBITMAP EntryBmp(const Entry *e, int sec) {
             memset(&si, 0, sizeof si);
             si.cbSize = sizeof si;
             if (SUCCEEDED(SHGetStockIconInfo(SIID_FOLDER, SHGSI_ICON | SHGSI_SMALLICON, &si))) ic = si.hIcon;
+        } else if (sec == SEC_BOOK) { /* стандартный значок интернет-ссылки */
+            SHFILEINFOW sfi;
+            memset(&sfi, 0, sizeof sfi);
+            if (SHGetFileInfoW(L"site.url", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof sfi, SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES)) ic = sfi.hIcon;
         } else if (e->action[0]) {
             wchar_t p[1100];
             if (e->action[0] == L'@') {
@@ -1775,6 +1904,7 @@ static void OnMenuSelect(WPARAM w, LPARAM l) {
         if (idx < g_cnt[sec]) {
             int ex = 0;
             if (g_ent[sec][idx].note[0]) tip = g_ent[sec][idx].note;
+            else if (sec == SEC_BOOK && g_ent[sec][idx].type == 0) tip = g_ent[sec][idx].action; /* у закладки подсказка — адрес */
             else if (g_ent[sec][idx].type == 0 && EntryTarget(&g_ent[sec][idx], tipPath, 1100, &ex)) tip = tipPath; /* нет подсказки: полный путь */
         }
         if (tip) {
@@ -2572,8 +2702,8 @@ static int BrowseDirAt(HWND owner, const wchar_t *cur, wchar_t *out) {
     return ok;
 }
 
-enum { ED_NAME = 601, ED_ACT, ED_PATH, ED_ARGS, ED_INTERP, ED_ICON, ED_NOTE, ED_ADMIN, ED_HIDE, ED_BFILE, ED_BDIR, ED_BINTERP, ED_BICON };
-typedef struct { Dlg d; int sec, type; Entry e; HWND eName, cb, ePath, eArgs, eInterp, eIcon, eNote, chAdmin, chHide; wchar_t lastAuto[128]; } EntDlg;
+enum { ED_NAME = 601, ED_ACT, ED_PATH, ED_ARGS, ED_INTERP, ED_ICON, ED_NOTE, ED_ADMIN, ED_HIDE, ED_BFILE, ED_BDIR, ED_BINTERP, ED_BICON, ED_BROWSER };
+typedef struct { Dlg d; int sec, type; Entry e; HWND eName, cb, ePath, eArgs, eInterp, eIcon, eNote, chAdmin, chHide, cbBr; wchar_t lastAuto[128]; } EntDlg;
 
 /* имя из пути подставляется, только если поле пустое или в нём наша прошлая подстановка;
    если пользователь ввёл имя сам, оно не трогается */
@@ -2781,6 +2911,15 @@ static void EntCmd(Dlg *d, int id, int code) {
                     GetWindowTextW(a->eArgs, e->args, 260);
                     if (!e->action[0]) { MessageBoxW(d->h, L"Введите путь, ссылку или программу.", APPNAME, MB_ICONINFORMATION); return; }
                 }
+            } else if (a->sec == SEC_BOOK) {
+                wchar_t raw[520];
+                GetWindowTextW(a->ePath, raw, 520);
+                NormUrl(raw, e->action, 520);
+                if (!e->action[0]) { MessageBoxW(d->h, L"Введите адрес закладки.", APPNAME, MB_ICONINFORMATION); return; }
+                GetWindowTextW(a->eArgs, e->args, 260);
+                Trim(e->args);
+                int bs = (int)SendMessageW(a->cbBr, CB_GETCURSEL, 0, 0);
+                if (bs > 0 && bs - 1 < g_nbr) cp(e->interp, WSZ(e->interp), g_br[bs - 1].path); else e->interp[0] = 0;
             } else {
                 GetWindowTextW(a->ePath, e->action, 520);
                 Trim(e->action);
@@ -2828,17 +2967,19 @@ static int EditEntryDlg(int sec, int type, Entry *e, const wchar_t *title, HWND 
             SendMessageW(a.cb, CB_ADDSTRING, 0, (LPARAM)L"Открыть файл / папку / ссылку / программу");
             y += 56;
         }
-        Lbl(h, sec == SEC_PROG ? L"Путь, ссылка или программа (можно перетащить файл сюда):"
+        Lbl(h, sec == SEC_BOOK ? L"Адрес закладки (URL, например https://example.com):"
+                : sec == SEC_PROG ? L"Путь, ссылка или программа (можно перетащить файл сюда):"
                 : (sec == SEC_SCRIPT ? L"Путь к скрипту (.bat, .cmd, .vbs, .js, .wsf, .ps1, .py … можно перетащить сюда):"
                 : (sec == SEC_FILES ? L"Путь к файлу (можно перетащить файл сюда):"
                                      : L"Путь к папке (можно перетащить папку сюда):")), 12, y, 496, 18);
-        a.ePath = Edt(h, 12, y + 20, 340, 24, ED_PATH);
-        if (sec == SEC_FOLDER) Btn(h, L"Выбрать папку…", 360, y + 20, 148, 24, ED_BDIR, 0);
+        a.ePath = Edt(h, 12, y + 20, sec == SEC_BOOK ? 496 : 340, 24, ED_PATH);
+        if (sec == SEC_BOOK) { }
+        else if (sec == SEC_FOLDER) Btn(h, L"Выбрать папку…", 360, y + 20, 148, 24, ED_BDIR, 0);
         else if (sec == SEC_SCRIPT || sec == SEC_FILES) Btn(h, L"Выбрать файл…", 360, y + 20, 148, 24, ED_BFILE, 0);
         else { Btn(h, L"Файл…", 360, y + 20, 70, 24, ED_BFILE, 0); Btn(h, L"Папка…", 436, y + 20, 72, 24, ED_BDIR, 0); }
         y += 56;
         if (sec != SEC_FOLDER && sec != SEC_FILES) {
-            Lbl(h, L"Аргументы (необязательно):", 12, y, 496, 18);
+            Lbl(h, sec == SEC_BOOK ? L"Доп. аргументы браузера (необязательно, например --incognito):" : L"Аргументы (необязательно):", 12, y, 496, 18);
             a.eArgs = Edt(h, 12, y + 20, 496, 24, ED_ARGS);
             y += 56;
         }
@@ -2849,8 +2990,14 @@ static int EditEntryDlg(int sec, int type, Entry *e, const wchar_t *title, HWND 
             Btn(h, L"Обзор…", 360, y + 20, 148, 24, ED_BINTERP, 0);
             y += 56;
         }
+        if (sec == SEC_BOOK) {
+            Lbl(h, L"Открывать в браузере:", 12, y, 496, 18);
+            a.cbBr = Mk(h, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, 12, y + 20, 496, 260, ED_BROWSER);
+            FillBrowserCombo(a.cbBr, e->interp, 1);
+            y += 56;
+        }
     }
-    Lbl(h, type == 1 ? L"Иконка (необязательно; пусто — обычная папка):" : L"Иконка (необязательно; пусто — берётся из самого файла/программы):", 12, y, 496, 18);
+    Lbl(h, type == 1 ? L"Иконка (необязательно; пусто — обычная папка):" : sec == SEC_BOOK ? L"Иконка (необязательно; пусто — стандартный значок ссылки):" : L"Иконка (необязательно; пусто — берётся из самого файла/программы):", 12, y, 496, 18);
     a.eIcon = Edt(h, 12, y + 20, 340, 24, ED_ICON);
     Btn(h, L"Обзор…", 360, y + 20, 148, 24, ED_BICON, 0);
     y += 56;
@@ -2965,7 +3112,7 @@ static int InsPos(int *depth) {
     return i + 1;
 }
 static void TreeCmd(HWND owner, int id) {
-    static const wchar_t *const newTitle[NSEC] = { L"Новая программа", L"Новый скрипт или команда", L"Новая папка быстрого доступа", L"Новый файл" };
+    static const wchar_t *const newTitle[NSEC] = { L"Новая программа", L"Новый скрипт или команда", L"Новая папка быстрого доступа", L"Новый файл", L"Новая закладка" };
     int i = SelIdx(), ns = -1, chg = 0;
     switch (id) {
     case 411: /* вверх */
@@ -3120,7 +3267,7 @@ static LRESULT CALLBACK TreeSub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id,
 }
 
 /* ---------- окно настроек со вкладками ---------- */
-enum { TAB_PROG = 0, TAB_SCRIPT, TAB_FOLDER, TAB_FILES, TAB_APP, TAB_ACT, TAB_MON, TAB_PIN, TAB_DESK, TAB_NUM, TAB_TIP, TAB_EXCL, TAB_GEN, NTABS };
+enum { TAB_PROG = 0, TAB_SCRIPT, TAB_FOLDER, TAB_FILES, TAB_BOOK, TAB_APP, TAB_ACT, TAB_MON, TAB_PIN, TAB_DESK, TAB_NUM, TAB_TIP, TAB_BR, TAB_EXCL, TAB_GEN, NTABS };
 typedef struct {
     Dlg d;
     HWND tab, page[NTABS];
@@ -3136,6 +3283,10 @@ typedef struct {
     Act ta[3];
     HWND stTAct[3], chTDup;
     HWND eNames, chOvName, eOvCapSize, cbOvCapPos, eTpHlFg, cbTpName;
+    HWND cbBrDef, lbBrInst, lbBrMan;
+    Browser tmpBr[16], comb[56];
+    int tmpNBr, ncomb;
+    wchar_t tmpDef[520];
     HWND chTip, eTpDelay, eTpFont, chTpBold, eTpSize, eTpFg, eTpBg, eTpA, chTpHl, eTpHl, chTpTitles;
     COLORREF tmpBg[8], tmpFg[8];
     int tsel;
@@ -3200,19 +3351,20 @@ static LRESULT CALLBACK PageProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-static const wchar_t *const g_tabName[NTABS] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Внешний вид", L"Действия кнопки", L"Мониторы", L"Закрепление окон", L"Рабочие столы", L"Номер стола", L"Окно у трея", L"Исключения", L"Общее" };
+static const wchar_t *const g_tabName[NTABS] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Закладки", L"Внешний вид", L"Действия кнопки", L"Мониторы", L"Закрепление окон", L"Рабочие столы", L"Номер стола", L"Окно у трея", L"Браузеры", L"Исключения", L"Общее" };
 static const wchar_t *const g_tActTitle[3] = { L"Левый клик по значку в трее", L"Двойной левый клик по значку в трее", L"Средняя кнопка по значку в трее" };
 static const wchar_t *const g_actTitle[3] = { L"Левый клик", L"Двойной левый клик", L"Средняя кнопка (колёсико)" };
 static const wchar_t *const g_cornerName[4] = { L"Левый верхний угол", L"Правый верхний угол", L"Левый нижний угол", L"Правый нижний угол" };
 
 static void PgTree(SetDlg *s, int sec, HWND pg, int PW, int PH) {
     (void)s;
-    static const wchar_t *const addText[NSEC] = { L"Добавить программу…", L"Добавить скрипт…", L"Добавить папку…", L"Добавить файл…" };
+    static const wchar_t *const addText[NSEC] = { L"Добавить программу…", L"Добавить скрипт…", L"Добавить папку…", L"Добавить файл…", L"Добавить закладку…" };
     static const wchar_t *const hint[NSEC] = {
         L"Перетащите сюда программы, ярлыки и любые файлы из проводника: пункты создадутся сами. Иконка берётся из файла. Двойной щелчок — изменить.",
         L"Перетащите сюда скрипты (.bat, .cmd, .vbs, .js, .wsf, .ps1, .py): пункты создадутся сами. Интерпретатор выбирается по расширению или задаётся вручную.",
         L"Перетащите сюда папки из проводника. Категории (например «Фото») создаются кнопкой «Добавить категорию», папки кладутся внутрь категории.",
-        L"Перетащите сюда любые файлы из проводника для быстрого открытия. Скрипты из этого раздела открываются в текстовом редакторе (задаётся на вкладке «Общее»), остальные файлы — как обычно."
+        L"Перетащите сюда любые файлы из проводника для быстрого открытия. Скрипты из этого раздела открываются в текстовом редакторе (задаётся на вкладке «Общее»), остальные файлы — как обычно.",
+        L"Закладки (ссылки). Категории — кнопкой «Добавить категорию». Клик по закладке открывает её в выбранном браузере; правая кнопка — «Открыть в…» с выбором браузера. Браузеры настраиваются на вкладке «Браузеры»."
     };
     HWND tr = Mk(pg, L"SysTreeView32", L"", WS_TABSTOP | TVS_HASLINES | TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE,
                  8, 8, PW - 196, PH - 62, 701 + sec);
@@ -3509,6 +3661,52 @@ static void PgTip(SetDlg *s, HWND pg) {
     Btn(pg, L"Применить и показать пример", 12, y, 300, 30, 1004, 0);
     Lbl(pg, L"Окно показывается над значком в трее, пока мышь остаётся на нём. Число окон не включает служебные и скрытые окна.", 12, y + 40, 780, 40);
 }
+static void BrKeepDef(SetDlg *s) { /* запомнить выбранный в списке браузер по умолчанию */
+    int sel = (int)SendMessageW(s->cbBrDef, CB_GETCURSEL, 0, 0);
+    if (sel > 0 && sel - 1 < s->ncomb) cp(s->tmpDef, 520, s->comb[sel - 1].path); else s->tmpDef[0] = 0;
+}
+static void BrFill(SetDlg *s) { /* перестроить списки на вкладке «Браузеры» */
+    SendMessageW(s->lbBrInst, LB_RESETCONTENT, 0, 0);
+    SendMessageW(s->lbBrMan, LB_RESETCONTENT, 0, 0);
+    s->ncomb = 0;
+    for (int i = 0; i < g_nbrInst && s->ncomb < 56; i++) {
+        wchar_t t[700];
+        _snwprintf(t, 700, L"%ls  —  %ls", g_br[i].name, g_br[i].path);
+        t[699] = 0;
+        SendMessageW(s->lbBrInst, LB_ADDSTRING, 0, (LPARAM)t);
+        s->comb[s->ncomb++] = g_br[i];
+    }
+    for (int i = 0; i < s->tmpNBr && s->ncomb < 56; i++) {
+        wchar_t t[700];
+        _snwprintf(t, 700, L"%ls  —  %ls", s->tmpBr[i].name, s->tmpBr[i].path);
+        t[699] = 0;
+        SendMessageW(s->lbBrMan, LB_ADDSTRING, 0, (LPARAM)t);
+        s->comb[s->ncomb++] = s->tmpBr[i];
+    }
+    SendMessageW(s->cbBrDef, CB_RESETCONTENT, 0, 0);
+    SendMessageW(s->cbBrDef, CB_ADDSTRING, 0, (LPARAM)L"Системный браузер по умолчанию");
+    int cur = 0;
+    for (int i = 0; i < s->ncomb; i++) {
+        SendMessageW(s->cbBrDef, CB_ADDSTRING, 0, (LPARAM)s->comb[i].name);
+        if (s->tmpDef[0] && !_wcsicmp(s->comb[i].path, s->tmpDef)) cur = i + 1;
+    }
+    SendMessageW(s->cbBrDef, CB_SETCURSEL, cur, 0);
+}
+static void PgBr(SetDlg *s, HWND pg, int PW, int PH) {
+    s->tmpNBr = g_nbrMan;
+    memcpy(s->tmpBr, g_brMan, sizeof s->tmpBr);
+    cp(s->tmpDef, 520, g_cfg.bookBrowser);
+    Lbl(pg, L"Браузер по умолчанию для закладок (можно переопределить для каждой закладки и через правую кнопку):", 12, 12, PW - 24, 20);
+    s->cbBrDef = Mk(pg, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, 12, 36, 520, 260, 1010);
+    Lbl(pg, L"Браузеры, найденные на этом компьютере:", 12, 76, 500, 20);
+    s->lbBrInst = Mk(pg, L"LISTBOX", L"", WS_VSCROLL | WS_HSCROLL | LBS_NOSEL, WS_EX_CLIENTEDGE, 12, 98, PW - 190, 100, 1015);
+    Btn(pg, L"Обновить список", PW - 164, 98, 150, 28, 1014, 0);
+    Lbl(pg, L"Свои (портабельные) браузеры:", 12, 214, 500, 20);
+    s->lbBrMan = Mk(pg, L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY, WS_EX_CLIENTEDGE, 12, 236, PW - 190, PH > 460 ? 150 : 110, 1011);
+    Btn(pg, L"Добавить…", PW - 164, 236, 150, 28, 1012, 0);
+    Btn(pg, L"Удалить", PW - 164, 272, 150, 28, 1013, 0);
+    BrFill(s);
+}
 static void PgExcl(SetDlg *s, HWND pg, int PW, int PH) {
     int eh = (PH - 190) / 2;
     if (eh < 60) eh = 60;
@@ -3639,6 +3837,13 @@ static int SetApply(SetDlg *s) {
         GetWindowTextW(s->eTpHlFg, b, 32); g_trayInfo.hlFg = ParseColor(b, g_trayInfo.hlFg);
         { int nm2 = (int)SendMessageW(s->cbTpName, CB_GETCURSEL, 0, 0); if (nm2 >= 0 && nm2 <= 2) g_trayInfo.nameMode = nm2; }
     }
+    {
+        BrKeepDef(s);
+        g_nbrMan = s->tmpNBr;
+        memcpy(g_brMan, s->tmpBr, sizeof g_brMan);
+        cp(g_cfg.bookBrowser, 520, s->tmpDef);
+        RebuildBrowsers(0);
+    }
     { int mi = (int)SendMessageW(s->cbMid, CB_GETCURSEL, 0, 0); if (mi >= 0 && mi <= 6) g_cfg.midItem = mi; }
     if (Chk(s->chAuto) != AutoGet()) AutoSet(Chk(s->chAuto));
     int dbg = Chk(s->chDebug);
@@ -3706,6 +3911,35 @@ static void SetCmd(Dlg *d, int id, int code) {
     case 967: PickOvColor(s, d->h, s->eNFgH, g_cfg.numFgH); break;
     case 969: PickOvColor(s, d->h, s->eNBg, g_cfg.numBg); break;
     case 971: PickOvColor(s, d->h, s->eNBgH, g_cfg.numBgH); break;
+    case 1012: { /* добавить свой браузер */
+        wchar_t f[MAX_PATH], nm[128];
+        if (s->tmpNBr >= 16) { MessageBoxW(d->h, L"Достигнут предел: 16 своих браузеров.", APPNAME, MB_ICONINFORMATION); break; }
+        if (!BrowseOpenAt(d->h, L"Программы (*.exe)\0*.exe\0Все файлы\0*.*\0", NULL, f, MAX_PATH)) break;
+        const wchar_t *bn = wcsrchr(f, L'\\');
+        cp(nm, 128, bn ? bn + 1 : f);
+        wchar_t *dot = wcsrchr(nm, L'.');
+        if (dot) *dot = 0;
+        g_modal = 1;
+        int okn = EditActDlg(AM_FOLDER, L"Название браузера", nm, NULL, NULL, NULL, d->h);
+        g_modal = 0;
+        if (!okn) break;
+        BrKeepDef(s);
+        cp(s->tmpBr[s->tmpNBr].name, 80, nm);
+        cp(s->tmpBr[s->tmpNBr].path, 520, f);
+        s->tmpNBr++;
+        BrFill(s);
+        break;
+    }
+    case 1013: { /* удалить свой браузер */
+        int sel = (int)SendMessageW(s->lbBrMan, LB_GETCURSEL, 0, 0);
+        if (sel < 0 || sel >= s->tmpNBr) break;
+        BrKeepDef(s);
+        for (int i = sel; i + 1 < s->tmpNBr; i++) s->tmpBr[i] = s->tmpBr[i + 1];
+        s->tmpNBr--;
+        BrFill(s);
+        break;
+    }
+    case 1014: BrKeepDef(s); DetectBrowsers(); BrFill(s); break;
     case 1006: PickOvColor(s, d->h, s->eTpHlFg, g_trayInfo.hlFg); break;
     case 996: PickOvColor(s, d->h, s->eTpFg, g_trayInfo.fg); break;
     case 998: PickOvColor(s, d->h, s->eTpBg, g_trayInfo.bg); break;
@@ -3810,6 +4044,7 @@ static void ShowSettings(void) {
     PgDesk(&s, s.page[TAB_DESK]);
     PgNum(&s, s.page[TAB_NUM]);
     PgTip(&s, s.page[TAB_TIP]);
+    PgBr(&s, s.page[TAB_BR], PW, PH);
     PgExcl(&s, s.page[TAB_EXCL], PW, PH);
     PgGen(&s, s.page[TAB_GEN]);
     g_cur = 0;
@@ -3863,7 +4098,7 @@ static HMENU BuildSection(int s) {
     return m;
 }
 static HMENU BuildMainMenu(void) {
-    static const wchar_t *const titles[NSEC] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы" };
+    static const wchar_t *const titles[NSEC] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Закладки" };
     HMENU m = CreatePopupMenu();
     for (int s = 0; s < NSEC; s++) AppendMenuW(m, MF_POPUP | MF_STRING, (UINT_PTR)BuildSection(s), titles[s]);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -3903,7 +4138,7 @@ static void HandleCmd(int cmd, MonBtn *b) {
     }
 }
 /* ---------- правая кнопка на пункте меню: свои действия ---------- */
-enum { CX_SHELL = 3001, CX_REVEAL, CX_COPYPATH, CX_COPYFILE, CX_PROPS, CX_EDIT, CX_RENAME, CX_OPEN, CX_ADMIN, CX_COPYNAME, CX_COPYCMD };
+enum { CX_SHELL = 3001, CX_REVEAL, CX_COPYPATH, CX_COPYFILE, CX_PROPS, CX_EDIT, CX_RENAME, CX_OPEN, CX_ADMIN, CX_COPYNAME, CX_COPYCMD, CX_BR0 = 3100 };
 static IContextMenu2 *g_cm2;
 static IContextMenu3 *g_cm3;
 static HHOOK g_mhook;
@@ -4020,10 +4255,35 @@ static void CtxAdd(CtxItem *it, int *n, int id, const wchar_t *t, UINT fl) {
     it[*n].flags = fl;
     (*n)++;
 }
+static void RenameEntry(Entry *e) { /* переименовать пункт меню (сам файл не трогаем) */
+    wchar_t nm[128];
+    cp(nm, 128, e->name);
+    g_modal = 1;
+    int okr = EditActDlg(AM_FOLDER, L"Переименовать пункт меню", nm, NULL, NULL, NULL, NULL);
+    g_modal = 0;
+    if (okr && nm[0]) { cp(e->name, 128, nm); SaveAll(); }
+}
 static int EntryCtxList(int sec, int idx, CtxItem *it) { /* набор пунктов зависит от раздела; возвращает число пунктов */
     int exists = 0, n = 0;
     wchar_t path[1100];
     if (sec < 0 || sec >= NSEC || idx < 0 || idx >= g_cnt[sec]) return 0;
+    if (sec == SEC_BOOK) { /* закладка: открыть в выбранном браузере, скопировать адрес */
+        CtxAdd(it, &n, CX_OPEN, L"Открыть", 0);
+        if (g_nbr) {
+            CtxAdd(it, &n, 0, NULL, MF_SEPARATOR);
+            for (int i = 0; i < g_nbr && i < 12; i++) {
+                wchar_t t[120];
+                _snwprintf(t, 120, L"Открыть в: %ls", g_br[i].name);
+                t[119] = 0;
+                CtxAdd(it, &n, CX_BR0 + i, t, 0);
+            }
+        }
+        CtxAdd(it, &n, 0, NULL, MF_SEPARATOR);
+        CtxAdd(it, &n, CX_COPYPATH, L"Скопировать адрес", 0);
+        CtxAdd(it, &n, 0, NULL, MF_SEPARATOR);
+        CtxAdd(it, &n, CX_RENAME, L"Переименовать пункт меню", 0);
+        return n;
+    }
     Entry *e = &g_ent[sec][idx];
     if (!EntryTarget(e, path, 1100, &exists)) return 0;
     int isDir = exists && IsDirPath(path);
@@ -4228,6 +4488,13 @@ static void EntryCtxRun(int sec, int idx, POINT pt, int cmd) { /* выполни
     wchar_t path[1100];
     if (cmd <= 0 || sec < 0 || sec >= NSEC || idx < 0 || idx >= g_cnt[sec]) return;
     Entry *e = &g_ent[sec][idx];
+    if (sec == SEC_BOOK) {
+        if (cmd == CX_OPEN) RunBookmark(e);
+        else if (cmd >= CX_BR0 && cmd < CX_BR0 + 48 && cmd - CX_BR0 < g_nbr) OpenUrlIn(e->action, g_br[cmd - CX_BR0].path, e->args);
+        else if (cmd == CX_COPYPATH) { wchar_t u[1100]; NormUrl(e->action, u, 1100); if (CopyText(u)) Balloon(L"Адрес скопирован", u); }
+        else if (cmd == CX_RENAME) RenameEntry(e);
+        return;
+    }
     if (!EntryTarget(e, path, 1100, &exists)) return;
     switch (cmd) {
     case CX_OPEN: RunEntry(sec, idx, NULL); break;
@@ -4279,15 +4546,7 @@ static void EntryCtxRun(int sec, int idx, POINT pt, int cmd) { /* выполни
         break;
     case CX_PROPS: ShowProps(path); break;
     case CX_EDIT: OpenInEditor(path); break;
-    case CX_RENAME: {
-        wchar_t nm[128];
-        cp(nm, 128, e->name);
-        g_modal = 1;
-        int okr = EditActDlg(AM_FOLDER, L"Переименовать пункт меню", nm, NULL, NULL, NULL, NULL);
-        g_modal = 0;
-        if (okr && nm[0]) { cp(e->name, 128, nm); SaveAll(); }
-        break;
-    }
+    case CX_RENAME: RenameEntry(e); break;
     }
 }
 static void ShowEntryContext(void) { /* после закрытия основного меню: выполнить отложенную команду (или показать меню) */
@@ -4320,6 +4579,16 @@ static int MidFromItem(HMENU hm, int pos, POINT pt) { /* средняя кноп
     int sec = (int)(id - ID_ENT0) / MAXE, idx = (int)(id - ID_ENT0) % MAXE;
     wchar_t tp[1100];
     int ex = 0;
+    if (sec == SEC_BOOK) { /* закладка: средняя кнопка копирует адрес */
+        if (idx >= g_cnt[sec]) return 0;
+        TipHide();
+        g_ctxSec = sec;
+        g_ctxIdx = idx;
+        g_ctxPt = pt;
+        g_pendCmd = CX_COPYPATH;
+        EndMenu();
+        return 1;
+    }
     if (idx >= g_cnt[sec] || !EntryTarget(&g_ent[sec][idx], tp, 1100, &ex)) return 0;
     int cmd = map[g_cfg.midItem];
     if (!cmd) return 1;
@@ -4655,6 +4924,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cl, int ns) {
     if (g_nmb == 0) return 1;
     if (g_debug) { DeleteFileW(g_log); LogStartup(); }
     if (fresh) SaveAll();
+    RebuildBrowsers(1);
     DeskNumChanged();
     if (!TrayAdd() && !g_cfg.show) { /* без значка в трее скрытые кнопки не вернуть */
         g_cfg.show = 1;
