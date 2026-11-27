@@ -26,7 +26,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.17.0"
+#define APPVER L"2.17.1"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 5
@@ -988,10 +988,11 @@ static void DeskNext(MonBtn *b) { /* следующий стол; с после�
 static void CheckDesktopSwitch(void) {
     if (g_inMenu || g_modal) return;
     if (g_ovTick > 0 && --g_ovTick == 0 && g_ov.show) ShowDeskOverlay(0);
+    if (g_deskNum <= 0) DeskNumChanged(); /* номер ещё не определён (например, при автозагрузке реестр был не готов) — пробуем снова */
     GUID cur;
     int src = ReadCurDesk(&cur);
     if (src) {
-        if (!g_haveReg) { g_regDesk = cur; g_haveReg = 1; Log(L"текущий виртуальный стол определён по реестру (источник %d)", src); }
+        if (!g_haveReg) { g_regDesk = cur; g_haveReg = 1; Log(L"текущий виртуальный стол определён по реестру (источник %d)", src); DeskNumChanged(); }
         else if (memcmp(&cur, &g_regDesk, sizeof cur)) {
             g_regDesk = cur;
             Log(L"смена виртуального стола (реестр)");
@@ -2412,7 +2413,7 @@ static void TrayHover(void) { /* мышь над значком в трее */
 }
 static void DeskNumChanged(void) { /* обновить номер стола на кнопках и в трее */
     int idx, n = DeskInfo(&idx);
-    int num = (n >= 1 && idx >= 0) ? idx + 1 : 0;
+    int num = (n >= 1 && idx >= 0) ? idx + 1 : (n == 0 ? 1 : 0); /* в реестре нет списка столов — стол один */
     int changed = num != g_deskNum;
     g_deskNum = num;
     if (g_cfg.content == 2) for (int i = 0; i < g_nmb; i++) if (g_mb[i] && g_mb[i]->hwnd) InvalidateRect(g_mb[i]->hwnd, NULL, FALSE);
