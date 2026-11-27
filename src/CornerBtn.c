@@ -11,6 +11,7 @@
 #define _WIN32_WINNT 0x0601
 #define _WIN32_IE 0x0600
 #include <windows.h>
+#include <winhttp.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
@@ -26,7 +27,7 @@
 #include <stdarg.h>
 
 #define APPNAME L"CornerBtn"
-#define APPVER L"2.17.1"
+#define APPVER L"2.18.0"
 #define IDI_APP 100
 #define MAXE 300
 #define NSEC 5
@@ -61,13 +62,15 @@ static int g_dpi = 96;
 static wchar_t g_ini[MAX_PATH], g_dir[MAX_PATH];
 static COLORREF g_cust[16];
 static struct { int show, size, opacity, pos, dur, outw, bold, showName, capSize, capPos; COLORREF col, outc; wchar_t font[64]; } g_ov;
+static struct { int on, fallback, proxyMode, timeout; wchar_t proxy[260]; } g_fav; /* proxyMode: 0 напрямую, 1 только через прокси, 2 сначала напрямую, при неудаче через прокси */
+static int g_favDirty;
 static wchar_t g_deskNames[512]; /* свои названия столов через «;» */ /* оверлей с номером рабочего стола */
 
 static MonBtn *g_mb[MAXMON];
 static int g_nmb;
 
 static Entry g_ent[NSEC][MAXE]; /* разделы меню: Программы, Скрипты и команды, Папки, Файлы, Закладки */
-typedef struct { wchar_t name[80], path[520]; } Browser;
+typedef struct { wchar_t name[80], path[520], args[260]; } Browser; /* args: шаблон параметров запуска, {url} — адрес */
 static Browser g_br[48]; /* все браузеры: сначала найденные в системе, затем свои (портабельные) */
 static int g_nbr, g_nbrInst;
 static Browser g_brMan[16]; /* свои (портабельные) браузеры из настроек */
@@ -429,12 +432,20 @@ static void LoadAll(void) {
     GetS(L"Button", L"Icon", L"", g_cfg.icon, MAX_PATH);
     g_cfg.content = Clamp(GetI(L"Button", L"Content", g_cfg.icon[0] ? 1 : 0), 0, 2);
     GetS(L"Bookmarks", L"DefaultBrowser", L"", g_cfg.bookBrowser, 520);
+    g_fav.on = GetI(L"FavIcons", L"Auto", 1) ? 1 : 0;
+    g_fav.fallback = GetI(L"FavIcons", L"Fallback", 0) ? 1 : 0;
+    g_fav.proxyMode = Clamp(GetI(L"FavIcons", L"ProxyMode", 2), 0, 2);
+    GetS(L"FavIcons", L"Proxy", L"", g_fav.proxy, 260);
+    g_fav.timeout = Clamp(GetI(L"FavIcons", L"TimeoutMs", 6000), 1000, 60000);
     g_nbrMan = Clamp(GetI(L"Browsers", L"Count", 0), 0, 16);
     for (int i = 0; i < g_nbrMan; i++) {
         wchar_t kn[16], kp[16];
         _snwprintf(kn, 16, L"Name%d", i + 1); _snwprintf(kp, 16, L"Path%d", i + 1);
         GetS(L"Browsers", kn, L"", g_brMan[i].name, 80);
         GetS(L"Browsers", kp, L"", g_brMan[i].path, 520);
+        wchar_t ka[16];
+        _snwprintf(ka, 16, L"Args%d", i + 1);
+        GetS(L"Browsers", ka, L"", g_brMan[i].args, 260);
     }
     GetS(L"NumButton", L"Font", L"Segoe UI", g_cfg.numFont, 64);
     g_cfg.numBold = GetI(L"NumButton", L"Bold", 1) ? 1 : 0;
@@ -530,12 +541,20 @@ static void SaveCfg(void) {
     PutI(L"Options", L"MenuMiddleClick", g_cfg.midItem);
     PutI(L"Button", L"Content", g_cfg.content);
     PutS(L"Bookmarks", L"DefaultBrowser", g_cfg.bookBrowser);
+    PutI(L"FavIcons", L"Auto", g_fav.on);
+    PutI(L"FavIcons", L"Fallback", g_fav.fallback);
+    PutI(L"FavIcons", L"ProxyMode", g_fav.proxyMode);
+    PutS(L"FavIcons", L"Proxy", g_fav.proxy);
+    PutI(L"FavIcons", L"TimeoutMs", g_fav.timeout);
     PutI(L"Browsers", L"Count", g_nbrMan);
     for (int i = 0; i < g_nbrMan; i++) {
         wchar_t kn[16], kp[16];
         _snwprintf(kn, 16, L"Name%d", i + 1); _snwprintf(kp, 16, L"Path%d", i + 1);
         PutS(L"Browsers", kn, g_brMan[i].name);
         PutS(L"Browsers", kp, g_brMan[i].path);
+        wchar_t ka[16];
+        _snwprintf(ka, 16, L"Args%d", i + 1);
+        PutS(L"Browsers", ka, g_brMan[i].args);
     }
     PutS(L"NumButton", L"Font", g_cfg.numFont);
     PutI(L"NumButton", L"Bold", g_cfg.numBold);
@@ -1606,6 +1625,7 @@ static void DetectBrowsers(void) { /* установленные браузер�
             if (dup || g_nbr >= 32) continue;
             cp(g_br[g_nbr].name, 80, name);
             cp(g_br[g_nbr].path, 520, path);
+            g_br[g_nbr].args[0] = 0;
             g_nbr++;
         }
         RegCloseKey(k);
@@ -1619,6 +1639,7 @@ static void RebuildBrowsers(int redetect) { /* найденные + свои */
         if (!g_brMan[i].path[0]) continue;
         cp(g_br[g_nbr].name, 80, g_brMan[i].name[0] ? g_brMan[i].name : L"Браузер");
         cp(g_br[g_nbr].path, 520, g_brMan[i].path);
+        cp(g_br[g_nbr].args, 260, g_brMan[i].args);
         g_nbr++;
     }
 }
@@ -1636,12 +1657,23 @@ static void OpenUrlIn(const wchar_t *url, const wchar_t *browser, const wchar_t 
     NormUrl(url, u, 1100);
     if (!u[0]) return;
     if (!browser || !browser[0]) { ShellExecuteW(NULL, L"open", u, NULL, NULL, SW_SHOWNORMAL); return; }
-    wchar_t br[1100], par[2500], ex[600];
+    wchar_t br[1100], par[2800], ex[600], body[1600];
     ExpandEnvironmentStringsW(browser, br, 1100);
     ExpandEnvironmentStringsW(extra ? extra : L"", ex, 600);
     Trim(ex);
-    if (ex[0]) _snwprintf(par, 2500, L"%ls \"%ls\"", ex, u); else _snwprintf(par, 2500, L"\"%ls\"", u);
-    par[2499] = 0;
+    const wchar_t *tpl = NULL;
+    for (int i = 0; i < g_nbr; i++) if (!_wcsicmp(g_br[i].path, browser) && g_br[i].args[0]) tpl = g_br[i].args;
+    if (tpl) { /* шаблон вызова: {url} заменяется адресом */
+        int bl = 0;
+        for (const wchar_t *c = tpl; *c && bl < 1590; ) {
+            if (!_wcsnicmp(c, L"{url}", 5)) { int ul = (int)wcslen(u); if (bl + ul > 1590) break; memcpy(body + bl, u, (size_t)ul * sizeof(wchar_t)); bl += ul; c += 5; }
+            else body[bl++] = *c++;
+        }
+        body[bl] = 0;
+    } else _snwprintf(body, 1600, L"\"%ls\"", u);
+    body[1599] = 0;
+    if (ex[0]) _snwprintf(par, 2800, L"%ls %ls", ex, body); else cp(par, 2800, body);
+    par[2799] = 0;
     HINSTANCE r = ShellExecuteW(NULL, L"open", br, par, NULL, SW_SHOWNORMAL);
     if ((INT_PTR)r <= 32) ShellExecuteW(NULL, L"open", u, NULL, NULL, SW_SHOWNORMAL); /* браузер не запустился: откроем обычным способом */
 }
@@ -1701,6 +1733,62 @@ static HBITMAP BmpFromIcon(HICON ic) {
     ReleaseDC(NULL, dc);
     return bm;
 }
+/* ---- GDI+ (подгружается динамически): картинки png/jpg/gif/ico -> HICON ---- */
+typedef struct { UINT32 ver; void *cb; BOOL noThread, noCodecs; } GdipInitIn;
+typedef int (WINAPI *PFN_GdiplusStartup)(ULONG_PTR *, const GdipInitIn *, void *);
+typedef int (WINAPI *PFN_GdipCreateBitmapFromStream)(IStream *, void **);
+typedef int (WINAPI *PFN_GdipGetImageThumbnail)(void *, UINT, UINT, void **, void *, void *);
+typedef int (WINAPI *PFN_GdipCreateHICONFromBitmap)(void *, HICON *);
+typedef int (WINAPI *PFN_GdipDisposeImage)(void *);
+typedef IStream *(WINAPI *PFN_SHCreateMemStream)(const BYTE *, UINT);
+static struct { int tried, ok; PFN_GdipCreateBitmapFromStream fromStream; PFN_GdipGetImageThumbnail thumb; PFN_GdipCreateHICONFromBitmap toIcon; PFN_GdipDisposeImage dispose; PFN_SHCreateMemStream memStream; } g_gp;
+static int GpInit(void) {
+    if (g_gp.tried) return g_gp.ok;
+    g_gp.tried = 1;
+    HMODULE gp = LoadLibraryW(L"gdiplus.dll"), sl = LoadLibraryW(L"shlwapi.dll");
+    if (!gp || !sl) return 0;
+    PFN_GdiplusStartup start = (PFN_GdiplusStartup)(void *)GetProcAddress(gp, "GdiplusStartup");
+    g_gp.fromStream = (PFN_GdipCreateBitmapFromStream)(void *)GetProcAddress(gp, "GdipCreateBitmapFromStream");
+    g_gp.thumb = (PFN_GdipGetImageThumbnail)(void *)GetProcAddress(gp, "GdipGetImageThumbnail");
+    g_gp.toIcon = (PFN_GdipCreateHICONFromBitmap)(void *)GetProcAddress(gp, "GdipCreateHICONFromBitmap");
+    g_gp.dispose = (PFN_GdipDisposeImage)(void *)GetProcAddress(gp, "GdipDisposeImage");
+    g_gp.memStream = (PFN_SHCreateMemStream)(void *)GetProcAddress(sl, "SHCreateMemStream");
+    if (!start || !g_gp.fromStream || !g_gp.thumb || !g_gp.toIcon || !g_gp.dispose || !g_gp.memStream) return 0;
+    ULONG_PTR tok = 0;
+    GdipInitIn in = { 1, NULL, FALSE, FALSE };
+    if (start(&tok, &in, NULL) != 0) return 0;
+    g_gp.ok = 1;
+    return 1;
+}
+static HICON IconFromBytes(const BYTE *data, DWORD n) { /* значок размера «маленькой иконки» из данных картинки */
+    if (!GpInit() || !n) return NULL;
+    IStream *st = g_gp.memStream(data, n);
+    if (!st) return NULL;
+    HICON ic = NULL;
+    void *img = NULL, *th = NULL;
+    if (g_gp.fromStream(st, &img) == 0 && img) {
+        if (g_gp.thumb(img, (UINT)GetSystemMetrics(SM_CXSMICON), (UINT)GetSystemMetrics(SM_CYSMICON), &th, NULL, NULL) == 0 && th) {
+            g_gp.toIcon(th, &ic);
+            g_gp.dispose(th);
+        }
+        g_gp.dispose(img);
+    }
+    st->lpVtbl->Release(st);
+    return ic;
+}
+static HICON IconFromImageFile(const wchar_t *path) {
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    DWORD sz = GetFileSize(f, NULL), rd = 0;
+    HICON ic = NULL;
+    if (sz && sz < 4000000) {
+        BYTE *buf = (BYTE *)malloc(sz);
+        if (buf && ReadFile(f, buf, sz, &rd, NULL) && rd == sz) ic = IconFromBytes(buf, sz);
+        free(buf);
+    }
+    CloseHandle(f);
+    return ic;
+}
 static HICON ManualIcon(const wchar_t *spec) { /* "файл", "файл,номер" или "@app" */
     wchar_t raw[MAX_PATH * 2], p[MAX_PATH * 2 + 8];
     int idx = 0;
@@ -1723,6 +1811,9 @@ static HICON ManualIcon(const wchar_t *spec) { /* "файл", "файл,номе
         if (GetFileAttributesW(q) != INVALID_FILE_ATTRIBUTES) cp(p, MAX_PATH * 2, q);
     }
     if (ExtractIconExW(p, idx, NULL, &sm, 1) >= 1) return sm;
+    const wchar_t *dot = wcsrchr(p, L'.');
+    if (dot && (!_wcsicmp(dot, L".png") || !_wcsicmp(dot, L".jpg") || !_wcsicmp(dot, L".jpeg") || !_wcsicmp(dot, L".gif") || !_wcsicmp(dot, L".bmp") || !_wcsicmp(dot, L".tif") || !_wcsicmp(dot, L".tiff")))
+        return IconFromImageFile(p);
     return NULL;
 }
 static HICON ShellIcon(const wchar_t *path, int isDir) {
@@ -1814,10 +1905,324 @@ static HICON StockIconFor(const wchar_t *action) { /* значки для вст
     if (SUCCEEDED(SHGetStockIconInfo(id, SHGSI_ICON | SHGSI_SMALLICON, &si))) return si.hIcon;
     return NULL;
 }
+/* ---------- значки сайтов для закладок: загрузка в фоне, кэш на диске, поддержка прокси ---------- */
+#define WM_FAVDONE (WM_APP + 41)
+static void HostOfUrl(const wchar_t *url, wchar_t *out, int n) { /* имя сайта в нижнем регистре, без порта */
+    wchar_t t[1100];
+    out[0] = 0;
+    cp(t, 1100, url ? url : L"");
+    Trim(t);
+    wchar_t *p = wcsstr(t, L"://");
+    if (!p) { if (!t[0] || !_wcsnicmp(t, L"mailto:", 7) || !_wcsnicmp(t, L"javascript:", 11) || !_wcsnicmp(t, L"about:", 6)) return; p = t; } else p += 3;
+    wchar_t *at = wcschr(p, L'@');
+    wchar_t *sl = wcschr(p, L'/');
+    if (at && (!sl || at < sl)) p = at + 1;
+    int len = 0;
+    while (p[len] && p[len] != L'/' && p[len] != L':' && p[len] != L'?' && p[len] != L'#' && len < n - 1) { out[len] = p[len]; len++; }
+    out[len] = 0;
+    _wcslwr(out);
+}
+static void FavDir(wchar_t *out, int n) {
+    _snwprintf(out, (size_t)n, L"%ls%ls", g_dir, L"icons\\");
+    out[n - 1] = 0;
+    CreateDirectoryW(out, NULL);
+}
+static void FavName(const wchar_t *host, const wchar_t *ext, wchar_t *out, int n) { /* путь к файлу кэша */
+    wchar_t d[MAX_PATH], hs[140];
+    cp(hs, 140, host);
+    for (wchar_t *c = hs; *c; c++) if (wcschr(L"\\/:*?\"<>|", *c)) *c = L'_';
+    FavDir(d, MAX_PATH);
+    _snwprintf(out, (size_t)n, L"%ls%ls.%ls", d, hs, ext);
+    out[n - 1] = 0;
+}
+static int FavFind(const wchar_t *host, wchar_t *out, int n) {
+    static const wchar_t *const ex[4] = { L"ico", L"png", L"gif", L"jpg" };
+    for (int i = 0; i < 4; i++) {
+        FavName(host, ex[i], out, n);
+        if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return 1;
+    }
+    return 0;
+}
+static int FavNoneRecent(const wchar_t *host) { /* недавняя неудача: не пытаемся снова (7 суток) */
+    wchar_t p[MAX_PATH * 2];
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    FavName(host, L"none", p, MAX_PATH * 2);
+    if (!GetFileAttributesExW(p, GetFileExInfoStandard, &fa)) return 0;
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    ULONGLONG a = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime, b = ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+    return a - b < (ULONGLONG)7 * 24 * 3600 * 10000000ULL;
+}
+/* --- WinHTTP, подгружается динамически --- */
+typedef HINTERNET (WINAPI *PFN_WhOpen)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+typedef HINTERNET (WINAPI *PFN_WhConnect)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+typedef HINTERNET (WINAPI *PFN_WhOpenReq)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR *, DWORD);
+typedef BOOL (WINAPI *PFN_WhSend)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
+typedef BOOL (WINAPI *PFN_WhRecv)(HINTERNET, LPVOID);
+typedef BOOL (WINAPI *PFN_WhQuery)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
+typedef BOOL (WINAPI *PFN_WhRead)(HINTERNET, LPVOID, DWORD, LPDWORD);
+typedef BOOL (WINAPI *PFN_WhClose)(HINTERNET);
+typedef BOOL (WINAPI *PFN_WhTimeouts)(HINTERNET, int, int, int, int);
+typedef BOOL (WINAPI *PFN_WhCrack)(LPCWSTR, DWORD, DWORD, LPURL_COMPONENTS);
+typedef BOOL (WINAPI *PFN_WhIeProxy)(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG *);
+static struct { int tried, ok; PFN_WhOpen open; PFN_WhConnect conn; PFN_WhOpenReq req; PFN_WhSend send; PFN_WhRecv recv; PFN_WhQuery query; PFN_WhRead read; PFN_WhClose close; PFN_WhTimeouts tmo; PFN_WhCrack crack; PFN_WhIeProxy ie; } g_wh;
+static int WhInit(void) {
+    if (g_wh.tried) return g_wh.ok;
+    g_wh.tried = 1;
+    HMODULE m = LoadLibraryW(L"winhttp.dll");
+    if (!m) return 0;
+    g_wh.open = (PFN_WhOpen)(void *)GetProcAddress(m, "WinHttpOpen");
+    g_wh.conn = (PFN_WhConnect)(void *)GetProcAddress(m, "WinHttpConnect");
+    g_wh.req = (PFN_WhOpenReq)(void *)GetProcAddress(m, "WinHttpOpenRequest");
+    g_wh.send = (PFN_WhSend)(void *)GetProcAddress(m, "WinHttpSendRequest");
+    g_wh.recv = (PFN_WhRecv)(void *)GetProcAddress(m, "WinHttpReceiveResponse");
+    g_wh.query = (PFN_WhQuery)(void *)GetProcAddress(m, "WinHttpQueryHeaders");
+    g_wh.read = (PFN_WhRead)(void *)GetProcAddress(m, "WinHttpReadData");
+    g_wh.close = (PFN_WhClose)(void *)GetProcAddress(m, "WinHttpCloseHandle");
+    g_wh.tmo = (PFN_WhTimeouts)(void *)GetProcAddress(m, "WinHttpSetTimeouts");
+    g_wh.crack = (PFN_WhCrack)(void *)GetProcAddress(m, "WinHttpCrackUrl");
+    g_wh.ie = (PFN_WhIeProxy)(void *)GetProcAddress(m, "WinHttpGetIEProxyConfigForCurrentUser");
+    g_wh.ok = g_wh.open && g_wh.conn && g_wh.req && g_wh.send && g_wh.recv && g_wh.query && g_wh.read && g_wh.close && g_wh.tmo && g_wh.crack;
+    return g_wh.ok;
+}
+static void OwnProxyToWinHttp(const wchar_t *in, wchar_t *out, int n) { /* "socks5://h:p" -> "socks=h:p"; "http://h:p" -> "h:p" */
+    wchar_t t[300];
+    cp(t, 300, in);
+    Trim(t);
+    int socks = !_wcsnicmp(t, L"socks", 5);
+    wchar_t *p = wcsstr(t, L"://");
+    p = p ? p + 3 : t;
+    if (socks) _snwprintf(out, (size_t)n, L"socks=%ls", p); else cp(out, (size_t)n, p);
+    out[n - 1] = 0;
+}
+/* proxyKind: 0 напрямую, 1 системный прокси, 2 свой прокси из настроек */
+static int HttpGet(const wchar_t *url, int proxyKind, DWORD maxBytes, BYTE **out, DWORD *outLen) {
+    *out = NULL;
+    *outLen = 0;
+    if (!WhInit()) return 0;
+    wchar_t host[256], path[1500], extra[800];
+    URL_COMPONENTS uc;
+    memset(&uc, 0, sizeof uc);
+    uc.dwStructSize = sizeof uc;
+    uc.lpszHostName = host; uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path; uc.dwUrlPathLength = 1500;
+    uc.lpszExtraInfo = extra; uc.dwExtraInfoLength = 800;
+    if (!g_wh.crack(url, 0, 0, &uc)) return 0;
+    wchar_t full[2400];
+    _snwprintf(full, 2400, L"%ls%ls", path[0] ? path : L"/", extra);
+    full[2399] = 0;
+    DWORD access = WINHTTP_ACCESS_TYPE_NO_PROXY;
+    wchar_t named[400] = L"";
+    WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ie;
+    int haveIe = 0;
+    if (proxyKind == 2 && g_fav.proxy[0]) { OwnProxyToWinHttp(g_fav.proxy, named, 400); access = WINHTTP_ACCESS_TYPE_NAMED_PROXY; }
+    else if (proxyKind >= 1) {
+        memset(&ie, 0, sizeof ie);
+        if (g_wh.ie && g_wh.ie(&ie)) {
+            haveIe = 1;
+            if (ie.lpszProxy) { cp(named, 400, ie.lpszProxy); access = WINHTTP_ACCESS_TYPE_NAMED_PROXY; }
+        }
+        if (access != WINHTTP_ACCESS_TYPE_NAMED_PROXY) access = WINHTTP_ACCESS_TYPE_DEFAULT_PROXY;
+    }
+    if (haveIe) { if (ie.lpszProxy) GlobalFree(ie.lpszProxy); if (ie.lpszProxyBypass) GlobalFree(ie.lpszProxyBypass); if (ie.lpszAutoConfigUrl) GlobalFree(ie.lpszAutoConfigUrl); }
+    int ok = 0;
+    HINTERNET ses = g_wh.open(L"Mozilla/5.0 (Windows NT 10.0) CornerBtn", access, access == WINHTTP_ACCESS_TYPE_NAMED_PROXY ? named : WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) return 0;
+    int to = g_fav.timeout > 1000 ? g_fav.timeout : 6000;
+    g_wh.tmo(ses, to, to, to, to * 2);
+    HINTERNET con = g_wh.conn(ses, host, uc.nPort, 0);
+    HINTERNET rq = con ? g_wh.req(con, L"GET", full, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : NULL;
+    if (rq && g_wh.send(rq, L"Accept-Encoding: identity\r\nAccept: image/*,text/html;q=0.9,*/*;q=0.5\r\n", (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && g_wh.recv(rq, NULL)) {
+        DWORD st = 0, sz = sizeof st;
+        if (g_wh.query(rq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sz, WINHTTP_NO_HEADER_INDEX) && st == 200) {
+            BYTE *buf = (BYTE *)malloc((size_t)maxBytes + 1);
+            DWORD tot = 0;
+            while (buf) {
+                DWORD got = 0;
+                if (tot >= maxBytes) break;
+                if (!g_wh.read(rq, buf + tot, maxBytes - tot, &got) || !got) break;
+                tot += got;
+            }
+            if (buf && tot) { buf[tot] = 0; *out = buf; *outLen = tot; ok = 1; } else free(buf);
+        }
+    }
+    if (rq) g_wh.close(rq);
+    if (con) g_wh.close(con);
+    g_wh.close(ses);
+    return ok;
+}
+static int FavGet(const wchar_t *url, DWORD maxBytes, BYTE **out, DWORD *n) { /* с учётом выбранного режима прокси */
+    int pk = g_fav.proxy[0] ? 2 : 1;
+    if (g_fav.proxyMode == 1) return HttpGet(url, pk, maxBytes, out, n);
+    if (HttpGet(url, 0, maxBytes, out, n)) return 1;
+    if (g_fav.proxyMode == 2) return HttpGet(url, pk, maxBytes, out, n);
+    return 0;
+}
+static const wchar_t *ImgExt(const BYTE *b, DWORD n) { /* по сигнатуре; NULL — не картинка */
+    if (n >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 1 && b[3] == 0) return L"ico";
+    if (n >= 8 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G') return L"png";
+    if (n >= 4 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F') return L"gif";
+    if (n >= 3 && b[0] == 0xFF && b[1] == 0xD8) return L"jpg";
+    return NULL;
+}
+static void ResolveHref(const wchar_t *host, const wchar_t *scheme, const char *href, wchar_t *out, int n) {
+    wchar_t h[700];
+    MultiByteToWideChar(CP_UTF8, 0, href, -1, h, 700);
+    h[699] = 0;
+    if (!_wcsnicmp(h, L"http://", 7) || !_wcsnicmp(h, L"https://", 8)) cp(out, (size_t)n, h);
+    else if (!wcsncmp(h, L"//", 2)) _snwprintf(out, (size_t)n, L"%ls:%ls", scheme, h);
+    else if (h[0] == L'/') _snwprintf(out, (size_t)n, L"%ls://%ls%ls", scheme, host, h);
+    else if (!_wcsnicmp(h, L"data:", 5)) out[0] = 0;
+    else _snwprintf(out, (size_t)n, L"%ls://%ls/%ls", scheme, host, h);
+    out[n - 1] = 0;
+}
+static int FavLinks(const char *html, const wchar_t *host, const wchar_t *scheme, wchar_t cands[6][700]) { /* <link rel="icon" href="..."> */
+    int nc = 0, apple = 0;
+    wchar_t appleUrl[700] = L"";
+    const char *p = html;
+    while (nc < 5 && (p = strstr(p, "<link")) != NULL) {
+        const char *e = strchr(p, '>');
+        if (!e) break;
+        char tag[1200];
+        size_t len = (size_t)(e - p);
+        if (len > 1190) len = 1190;
+        memcpy(tag, p, len);
+        tag[len] = 0;
+        p = e;
+        char low[1200];
+        for (size_t i = 0; i <= len; i++) low[i] = (char)((tag[i] >= 'A' && tag[i] <= 'Z') ? tag[i] + 32 : tag[i]);
+        char *rel = strstr(low, "rel=");
+        char *hr = strstr(low, "href=");
+        if (!rel || !hr) continue;
+        rel += 4;
+        char q = (*rel == '"' || *rel == '\'') ? *rel++ : ' ';
+        char relv[100];
+        size_t rl = 0;
+        while (rel[rl] && rel[rl] != q && rl < 99) { relv[rl] = rel[rl]; rl++; }
+        relv[rl] = 0;
+        if (!strstr(relv, "icon") || strstr(relv, "mask-icon")) continue;
+        size_t off = (size_t)(hr - low) + 5;
+        char hq = (tag[off] == '"' || tag[off] == '\'') ? tag[off++] : ' ';
+        char hv[600];
+        size_t hl = 0;
+        while (tag[off + hl] && tag[off + hl] != hq && tag[off + hl] != '>' && hl < 599) { hv[hl] = tag[off + hl]; hl++; }
+        hv[hl] = 0;
+        char *amp;
+        while ((amp = strstr(hv, "&amp;")) != NULL) memmove(amp + 1, amp + 5, strlen(amp + 5) + 1);
+        size_t L2 = strlen(hv);
+        if (L2 > 4 && !strcmp(hv + L2 - 4, ".svg")) continue; /* svg не поддерживаем */
+        wchar_t u[700];
+        ResolveHref(host, scheme, hv, u, 700);
+        if (!u[0]) continue;
+        if (strstr(relv, "apple")) { if (!apple) { cp(appleUrl, 700, u); apple = 1; } continue; }
+        cp(cands[nc++], 700, u);
+    }
+    if (apple && nc < 5) cp(cands[nc++], 700, appleUrl);
+    return nc;
+}
+static int FavFetchHost(const wchar_t *host) { /* 1 — значок сохранён в кэш */
+    wchar_t cands[8][700];
+    int nc = 0;
+    BYTE *buf;
+    DWORD n;
+    wchar_t url[700];
+    for (int sch = 0; sch < 2 && !nc; sch++) { /* страница сайта: ищем <link rel="icon"> */
+        const wchar_t *sc = sch == 0 ? L"https" : L"http";
+        _snwprintf(url, 700, L"%ls://%ls/", sc, host);
+        url[699] = 0;
+        if (FavGet(url, 250000, &buf, &n)) {
+            wchar_t c6[6][700];
+            nc = FavLinks((const char *)buf, host, sc, c6);
+            for (int i = 0; i < nc; i++) cp(cands[i], 700, c6[i]);
+            free(buf);
+        }
+    }
+    _snwprintf(cands[nc++], 700, L"https://%ls/favicon.ico", host);
+    _snwprintf(cands[nc++], 700, L"http://%ls/favicon.ico", host);
+    if (g_fav.fallback) _snwprintf(cands[nc++], 700, L"https://icons.duckduckgo.com/ip3/%ls.ico", host);
+    for (int i = 0; i < nc; i++) {
+        cands[i][699] = 0;
+        if (!FavGet(cands[i], 1500000, &buf, &n)) continue;
+        const wchar_t *ext = ImgExt(buf, n);
+        int ok = 0;
+        if (ext) {
+            HICON ic = IconFromBytes(buf, n); /* убеждаемся, что картинка читается */
+            if (ic) {
+                DestroyIcon(ic);
+                wchar_t fp[MAX_PATH * 2];
+                FavName(host, ext, fp, MAX_PATH * 2);
+                HANDLE f = CreateFileW(fp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, buf, n, &w, NULL); CloseHandle(f); ok = w == n; }
+            }
+        }
+        free(buf);
+        if (ok) { Log(L"значок сайта %ls: сохранён (%ls)", host, cands[i]); return 1; }
+    }
+    wchar_t np[MAX_PATH * 2];
+    FavName(host, L"none", np, MAX_PATH * 2); /* отметка о неудаче */
+    HANDLE f = CreateFileW(np, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    Log(L"значок сайта %ls: получить не удалось", host);
+    return 0;
+}
+static wchar_t g_favq[200][128];
+static int g_favN, g_favRun, g_favCSOk;
+static CRITICAL_SECTION g_favCS;
+static DWORD WINAPI FavThread(LPVOID p) {
+    (void)p;
+    for (;;) {
+        wchar_t host[128];
+        EnterCriticalSection(&g_favCS);
+        if (!g_favN) { g_favRun = 0; LeaveCriticalSection(&g_favCS); break; }
+        cp(host, 128, g_favq[0]);
+        for (int i = 1; i < g_favN; i++) cp(g_favq[i - 1], 128, g_favq[i]);
+        g_favN--;
+        LeaveCriticalSection(&g_favCS);
+        int ok = FavFetchHost(host);
+        PostMessageW(g_ctl, WM_FAVDONE, (WPARAM)ok, 0);
+    }
+    return 0;
+}
+static void FavQueue(const wchar_t *host, int force) {
+    wchar_t fp[MAX_PATH * 2];
+    if (!g_fav.on || !host || !host[0]) return;
+    if (!force && (FavFind(host, fp, MAX_PATH * 2) || FavNoneRecent(host))) return;
+    if (!g_favCSOk) { InitializeCriticalSection(&g_favCS); g_favCSOk = 1; }
+    EnterCriticalSection(&g_favCS);
+    int dup = 0;
+    for (int i = 0; i < g_favN; i++) if (!wcscmp(g_favq[i], host)) dup = 1;
+    if (!dup && g_favN < 200) { cp(g_favq[g_favN++], 128, host); }
+    int start = !g_favRun && g_favN;
+    if (start) g_favRun = 1;
+    LeaveCriticalSection(&g_favCS);
+    if (start) {
+        HANDLE th = CreateThread(NULL, 0, FavThread, NULL, 0, NULL);
+        if (th) CloseHandle(th); else { EnterCriticalSection(&g_favCS); g_favRun = 0; LeaveCriticalSection(&g_favCS); }
+    }
+}
+static void FavClear(void) { /* удалить кэш значков (файлы и отметки неудач) */
+    wchar_t d[MAX_PATH], pat[MAX_PATH + 4];
+    FavDir(d, MAX_PATH);
+    _snwprintf(pat, MAX_PATH + 4, L"%ls*", d);
+    pat[MAX_PATH + 3] = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        wchar_t fp[MAX_PATH * 2];
+        _snwprintf(fp, MAX_PATH * 2, L"%ls%ls", d, fd.cFileName);
+        fp[MAX_PATH * 2 - 1] = 0;
+        DeleteFileW(fp);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
 static HBITMAP EntryBmp(const Entry *e, int sec) {
     if (e->type == 2) return NULL;
+    wchar_t hostKey[140] = L"";
+    if (sec == SEC_BOOK && e->type == 0) HostOfUrl(e->action, hostKey, 140);
     wchar_t key[900];
-    _snwprintf(key, 900, L"%d|%d|%ls|%ls", sec, e->type, e->icon, (e->type == 1 || sec == SEC_BOOK) ? L"" : e->action);
+    _snwprintf(key, 900, L"%d|%d|%ls|%ls", sec, e->type, e->icon, e->type == 1 ? L"" : (sec == SEC_BOOK ? hostKey : e->action));
     key[899] = 0;
     for (int i = 0; i < g_nic; i++) if (!wcscmp(g_ic[i].key, key)) return g_ic[i].bmp;
     if (g_nic >= ICACHE_MAX) return NULL;
@@ -1830,10 +2235,15 @@ static HBITMAP EntryBmp(const Entry *e, int sec) {
             memset(&si, 0, sizeof si);
             si.cbSize = sizeof si;
             if (SUCCEEDED(SHGetStockIconInfo(SIID_FOLDER, SHGSI_ICON | SHGSI_SMALLICON, &si))) ic = si.hIcon;
-        } else if (sec == SEC_BOOK) { /* стандартный значок интернет-ссылки */
-            SHFILEINFOW sfi;
-            memset(&sfi, 0, sizeof sfi);
-            if (SHGetFileInfoW(L"site.url", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof sfi, SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES)) ic = sfi.hIcon;
+        } else if (sec == SEC_BOOK) { /* значок сайта из кэша, иначе стандартный значок ссылки (и ставим загрузку в очередь) */
+            wchar_t fp[MAX_PATH * 2];
+            if (hostKey[0] && g_fav.on && FavFind(hostKey, fp, MAX_PATH * 2)) ic = IconFromImageFile(fp);
+            if (!ic) {
+                SHFILEINFOW sfi;
+                memset(&sfi, 0, sizeof sfi);
+                if (SHGetFileInfoW(L"site.url", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof sfi, SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES)) ic = sfi.hIcon;
+                if (hostKey[0]) FavQueue(hostKey, 0);
+            }
         } else if (e->action[0]) {
             wchar_t p[1100];
             if (e->action[0] == L'@') {
@@ -2884,7 +3294,7 @@ static void EntCmd(Dlg *d, int id, int code) {
     {
         wchar_t cur[1100];
         GetWindowTextW(a->eIcon, cur, 1100);
-        if (BrowseOpenAt(d->h, L"Иконки (*.ico;*.exe;*.dll)\0*.ico;*.exe;*.dll\0Все файлы\0*.*\0", cur, f, MAX_PATH)) SetWindowTextW(a->eIcon, f);
+        if (BrowseOpenAt(d->h, L"Иконки и картинки\0*.ico;*.exe;*.dll;*.png;*.jpg;*.jpeg;*.gif;*.bmp\0Все файлы\0*.*\0", cur, f, MAX_PATH)) SetWindowTextW(a->eIcon, f);
         break;
     }
     case IDOK: {
@@ -3268,7 +3678,7 @@ static LRESULT CALLBACK TreeSub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id,
 }
 
 /* ---------- окно настроек со вкладками ---------- */
-enum { TAB_PROG = 0, TAB_SCRIPT, TAB_FOLDER, TAB_FILES, TAB_BOOK, TAB_APP, TAB_ACT, TAB_MON, TAB_PIN, TAB_DESK, TAB_NUM, TAB_TIP, TAB_BR, TAB_EXCL, TAB_GEN, NTABS };
+enum { TAB_PROG = 0, TAB_SCRIPT, TAB_FOLDER, TAB_FILES, TAB_BOOK, TAB_APP, TAB_ACT, TAB_MON, TAB_PIN, TAB_DESK, TAB_NUM, TAB_TIP, TAB_BR, TAB_FAV, TAB_EXCL, TAB_GEN, NTABS };
 typedef struct {
     Dlg d;
     HWND tab, page[NTABS];
@@ -3284,7 +3694,7 @@ typedef struct {
     Act ta[3];
     HWND stTAct[3], chTDup;
     HWND eNames, chOvName, eOvCapSize, cbOvCapPos, eTpHlFg, cbTpName;
-    HWND cbBrDef, lbBrInst, lbBrMan;
+    HWND cbBrDef, lbBrInst, lbBrMan, chFavOn, chFavFb, cbFavProxy, eFavProxy, eFavTmo;
     Browser tmpBr[16], comb[56];
     int tmpNBr, ncomb;
     wchar_t tmpDef[520];
@@ -3352,7 +3762,7 @@ static LRESULT CALLBACK PageProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-static const wchar_t *const g_tabName[NTABS] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Закладки", L"Внешний вид", L"Действия кнопки", L"Мониторы", L"Закрепление окон", L"Рабочие столы", L"Номер стола", L"Окно у трея", L"Браузеры", L"Исключения", L"Общее" };
+static const wchar_t *const g_tabName[NTABS] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Закладки", L"Внешний вид", L"Действия кнопки", L"Мониторы", L"Закрепление окон", L"Рабочие столы", L"Номер стола", L"Окно у трея", L"Браузеры", L"Значки закладок", L"Исключения", L"Общее" };
 static const wchar_t *const g_tActTitle[3] = { L"Левый клик по значку в трее", L"Двойной левый клик по значку в трее", L"Средняя кнопка по значку в трее" };
 static const wchar_t *const g_actTitle[3] = { L"Левый клик", L"Двойной левый клик", L"Средняя кнопка (колёсико)" };
 static const wchar_t *const g_cornerName[4] = { L"Левый верхний угол", L"Правый верхний угол", L"Левый нижний угол", L"Правый нижний угол" };
@@ -3662,6 +4072,67 @@ static void PgTip(SetDlg *s, HWND pg) {
     Btn(pg, L"Применить и показать пример", 12, y, 300, 30, 1004, 0);
     Lbl(pg, L"Окно показывается над значком в трее, пока мышь остаётся на нём. Число окон не включает служебные и скрытые окна.", 12, y + 40, 780, 40);
 }
+typedef struct { Dlg d; Browser b; HWND eName, ePath, eArgs; } BrDlg;
+static void BrDlgCmd(Dlg *d, int id, int code) {
+    BrDlg *a = (BrDlg *)d;
+    (void)code;
+    switch (id) {
+    case 803: {
+        wchar_t f[MAX_PATH], cur[1100];
+        GetWindowTextW(a->ePath, cur, 1100);
+        if (BrowseOpenAt(d->h, L"Программы (*.exe)\0*.exe\0Все файлы\0*.*\0", cur, f, MAX_PATH)) {
+            SetWindowTextW(a->ePath, f);
+            wchar_t nm[128];
+            GetWindowTextW(a->eName, nm, 128);
+            Trim(nm);
+            if (!nm[0]) { /* название по имени файла */
+                const wchar_t *bn = wcsrchr(f, L'\\');
+                cp(nm, 128, bn ? bn + 1 : f);
+                wchar_t *dot = wcsrchr(nm, L'.');
+                if (dot) *dot = 0;
+                SetWindowTextW(a->eName, nm);
+            }
+        }
+        break;
+    }
+    case IDOK: {
+        GetWindowTextW(a->eName, a->b.name, 80);
+        GetWindowTextW(a->ePath, a->b.path, 520);
+        GetWindowTextW(a->eArgs, a->b.args, 260);
+        Trim(a->b.name);
+        Trim(a->b.path);
+        Trim(a->b.args);
+        if (!a->b.name[0] || !a->b.path[0]) { MessageBoxW(d->h, L"Укажите название и путь к программе браузера.", APPNAME, MB_ICONINFORMATION); return; }
+        d->result = 1;
+        d->done = 1;
+        break;
+    }
+    case IDCANCEL: d->done = 1; break;
+    }
+}
+static int EditBrowserDlg(Browser *b, HWND owner) { /* свой (портабельный) браузер: название, путь, шаблон вызова */
+    BrDlg a;
+    memset(&a, 0, sizeof a);
+    a.b = *b;
+    NewDlg(&a.d, L"Свой браузер", 520, 232);
+    a.d.oncmd = BrDlgCmd;
+    HWND h = a.d.h;
+    Lbl(h, L"Название (показывается в меню «Открыть в: …»):", 12, 10, 496, 18);
+    a.eName = Edt(h, 12, 30, 496, 24, 801);
+    Lbl(h, L"Путь к программе браузера:", 12, 62, 496, 18);
+    a.ePath = Edt(h, 12, 82, 380, 24, 802);
+    Btn(h, L"Обзор…", 400, 82, 108, 24, 803, 0);
+    Lbl(h, L"Шаблон параметров запуска (необязательно, для нестандартных браузеров). {url} заменяется адресом закладки. Пусто — просто адрес в кавычках. Примеры: -new-tab \"{url}\"   или   --app={url}", 12, 114, 496, 48);
+    a.eArgs = Edt(h, 12, 164, 496, 24, 804);
+    SetWindowTextW(a.eName, b->name);
+    SetWindowTextW(a.ePath, b->path);
+    SetWindowTextW(a.eArgs, b->args);
+    Btn(h, L"OK", 318, 196, 90, 28, IDOK, 1);
+    Btn(h, L"Отмена", 418, 196, 90, 28, IDCANCEL, 0);
+    if (!RunModal(&a.d, owner)) return 0;
+    *b = a.b;
+    return 1;
+}
 static void BrKeepDef(SetDlg *s) { /* запомнить выбранный в списке браузер по умолчанию */
     int sel = (int)SendMessageW(s->cbBrDef, CB_GETCURSEL, 0, 0);
     if (sel > 0 && sel - 1 < s->ncomb) cp(s->tmpDef, 520, s->comb[sel - 1].path); else s->tmpDef[0] = 0;
@@ -3705,8 +4176,49 @@ static void PgBr(SetDlg *s, HWND pg, int PW, int PH) {
     Lbl(pg, L"Свои (портабельные) браузеры:", 12, 214, 500, 20);
     s->lbBrMan = Mk(pg, L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY, WS_EX_CLIENTEDGE, 12, 236, PW - 190, PH > 460 ? 150 : 110, 1011);
     Btn(pg, L"Добавить…", PW - 164, 236, 150, 28, 1012, 0);
-    Btn(pg, L"Удалить", PW - 164, 272, 150, 28, 1013, 0);
+    Btn(pg, L"Изменить…", PW - 164, 272, 150, 28, 1016, 0);
+    Btn(pg, L"Удалить", PW - 164, 308, 150, 28, 1013, 0);
     BrFill(s);
+}
+static void FavForget(const wchar_t *host) { /* удалить кэш значка сайта */
+    static const wchar_t *const ex[5] = { L"ico", L"png", L"gif", L"jpg", L"none" };
+    for (int i = 0; i < 5; i++) {
+        wchar_t p[MAX_PATH * 2];
+        FavName(host, ex[i], p, MAX_PATH * 2);
+        DeleteFileW(p);
+    }
+}
+static void FavForceAll(void) { /* скачать значки всех закладок заново */
+    for (int i = 0; i < g_cnt[SEC_BOOK]; i++) {
+        const Entry *e = &g_ent[SEC_BOOK][i];
+        wchar_t host[128];
+        if (e->type != 0 || e->icon[0]) continue;
+        HostOfUrl(e->action, host, 128);
+        if (!host[0]) continue;
+        FavForget(host);
+        FavQueue(host, 1);
+    }
+}
+static void PgFav(SetDlg *s, HWND pg, int PW) {
+    wchar_t b[16];
+    s->chFavOn = Chkbox(pg, L"Загружать значки сайтов для закладок автоматически (в фоне; кэш — папка icons рядом с программой)", 12, 12, PW - 24, 1020, g_fav.on);
+    s->chFavFb = Chkbox(pg, L"Если сайт значок не отдал — запросить у сервиса DuckDuckGo (сервис узнает адрес сайта)", 12, 44, PW - 24, 1021, g_fav.fallback);
+    Lbl(pg, L"Прокси для загрузки значков:", 12, 84, 400, 20);
+    s->cbFavProxy = Mk(pg, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0, 12, 106, 520, 200, 1022);
+    SendMessageW(s->cbFavProxy, CB_ADDSTRING, 0, (LPARAM)L"Не использовать (только напрямую)");
+    SendMessageW(s->cbFavProxy, CB_ADDSTRING, 0, (LPARAM)L"Только через прокси");
+    SendMessageW(s->cbFavProxy, CB_ADDSTRING, 0, (LPARAM)L"Сначала напрямую, если не вышло — через прокси");
+    SendMessageW(s->cbFavProxy, CB_SETCURSEL, g_fav.proxyMode, 0);
+    Lbl(pg, L"Адрес прокси (пусто — системный прокси Windows). Примеры: http://127.0.0.1:8080   socks5://127.0.0.1:1080", 12, 144, PW - 24, 36);
+    s->eFavProxy = Edt(pg, 12, 182, 520, 24, 1023);
+    SetWindowTextW(s->eFavProxy, g_fav.proxy);
+    Lbl(pg, L"Время ожидания одного запроса, мс:", 12, 222, 340, 20);
+    s->eFavTmo = Edt(pg, 360, 218, 90, 24, 1024);
+    _snwprintf(b, 16, L"%d", g_fav.timeout);
+    SetWindowTextW(s->eFavTmo, b);
+    Btn(pg, L"Обновить значки всех закладок", 12, 262, 320, 30, 1025, 0);
+    Btn(pg, L"Очистить кэш значков", 344, 262, 240, 30, 1026, 0);
+    Lbl(pg, L"Свой значок для отдельной закладки: «Изменить» у закладки → поле «Иконка» (подходят .ico, .png, .jpg, .gif, .bmp, а также exe/dll).", 12, 308, PW - 24, 40);
 }
 static void PgExcl(SetDlg *s, HWND pg, int PW, int PH) {
     int eh = (PH - 190) / 2;
@@ -3839,6 +4351,15 @@ static int SetApply(SetDlg *s) {
         { int nm2 = (int)SendMessageW(s->cbTpName, CB_GETCURSEL, 0, 0); if (nm2 >= 0 && nm2 <= 2) g_trayInfo.nameMode = nm2; }
     }
     {
+        g_fav.on = Chk(s->chFavOn);
+        g_fav.fallback = Chk(s->chFavFb);
+        { int pm = (int)SendMessageW(s->cbFavProxy, CB_GETCURSEL, 0, 0); if (pm >= 0 && pm <= 2) g_fav.proxyMode = pm; }
+        GetWindowTextW(s->eFavProxy, g_fav.proxy, 260);
+        Trim(g_fav.proxy);
+        g_fav.timeout = EdI(s->eFavTmo, 1000, 60000, g_fav.timeout);
+        FlushIconCache();
+    }
+    {
         BrKeepDef(s);
         g_nbrMan = s->tmpNBr;
         memcpy(g_brMan, s->tmpBr, sizeof g_brMan);
@@ -3888,7 +4409,7 @@ static void SetCmd(Dlg *d, int id, int code) {
         break;
     }
     case 207:
-        if (BrowseOpen(d->h, L"Иконки (*.ico;*.exe;*.dll)\0*.ico;*.exe;*.dll\0Все файлы\0*.*\0", f, MAX_PATH)) SetWindowTextW(s->eIcon, f);
+        if (BrowseOpen(d->h, L"Иконки и картинки\0*.ico;*.exe;*.dll;*.png;*.jpg;*.jpeg;*.gif;*.bmp\0Все файлы\0*.*\0", f, MAX_PATH)) SetWindowTextW(s->eIcon, f);
         break;
     case 209: SetWindowTextW(s->eIcon, L"@app"); break;
     case 385: TrayDupUi(s); break;
@@ -3912,22 +4433,38 @@ static void SetCmd(Dlg *d, int id, int code) {
     case 967: PickOvColor(s, d->h, s->eNFgH, g_cfg.numFgH); break;
     case 969: PickOvColor(s, d->h, s->eNBg, g_cfg.numBg); break;
     case 971: PickOvColor(s, d->h, s->eNBgH, g_cfg.numBgH); break;
+    case 1025: SetApply(s); FavForceAll(); Balloon(L"Значки закладок", L"Загрузка значков запущена в фоне."); break;
+    case 1026: FavClear(); FlushIconCache(); Balloon(L"Значки закладок", L"Кэш значков очищен."); break;
     case 1012: { /* добавить свой браузер */
-        wchar_t f[MAX_PATH], nm[128];
+        wchar_t f[MAX_PATH];
+        Browser nb;
         if (s->tmpNBr >= 16) { MessageBoxW(d->h, L"Достигнут предел: 16 своих браузеров.", APPNAME, MB_ICONINFORMATION); break; }
         if (!BrowseOpenAt(d->h, L"Программы (*.exe)\0*.exe\0Все файлы\0*.*\0", NULL, f, MAX_PATH)) break;
+        memset(&nb, 0, sizeof nb);
+        cp(nb.path, 520, f);
         const wchar_t *bn = wcsrchr(f, L'\\');
-        cp(nm, 128, bn ? bn + 1 : f);
-        wchar_t *dot = wcsrchr(nm, L'.');
+        cp(nb.name, 80, bn ? bn + 1 : f);
+        wchar_t *dot = wcsrchr(nb.name, L'.');
         if (dot) *dot = 0;
         g_modal = 1;
-        int okn = EditActDlg(AM_FOLDER, L"Название браузера", nm, NULL, NULL, NULL, d->h);
+        int okn = EditBrowserDlg(&nb, d->h);
         g_modal = 0;
         if (!okn) break;
         BrKeepDef(s);
-        cp(s->tmpBr[s->tmpNBr].name, 80, nm);
-        cp(s->tmpBr[s->tmpNBr].path, 520, f);
-        s->tmpNBr++;
+        s->tmpBr[s->tmpNBr++] = nb;
+        BrFill(s);
+        break;
+    }
+    case 1016: { /* изменить свой браузер */
+        int sel = (int)SendMessageW(s->lbBrMan, LB_GETCURSEL, 0, 0);
+        if (sel < 0 || sel >= s->tmpNBr) { MessageBoxW(d->h, L"Выберите браузер в списке «Свои браузеры».", APPNAME, MB_ICONINFORMATION); break; }
+        Browser nb = s->tmpBr[sel];
+        g_modal = 1;
+        int okn = EditBrowserDlg(&nb, d->h);
+        g_modal = 0;
+        if (!okn) break;
+        BrKeepDef(s);
+        s->tmpBr[sel] = nb;
         BrFill(s);
         break;
     }
@@ -4046,6 +4583,7 @@ static void ShowSettings(void) {
     PgNum(&s, s.page[TAB_NUM]);
     PgTip(&s, s.page[TAB_TIP]);
     PgBr(&s, s.page[TAB_BR], PW, PH);
+    PgFav(&s, s.page[TAB_FAV], PW);
     PgExcl(&s, s.page[TAB_EXCL], PW, PH);
     PgGen(&s, s.page[TAB_GEN]);
     g_cur = 0;
@@ -4099,6 +4637,7 @@ static HMENU BuildSection(int s) {
     return m;
 }
 static HMENU BuildMainMenu(void) {
+    if (g_favDirty) { FlushIconCache(); g_favDirty = 0; }
     static const wchar_t *const titles[NSEC] = { L"Программы", L"Скрипты и команды", L"Папки", L"Файлы", L"Закладки" };
     HMENU m = CreatePopupMenu();
     for (int s = 0; s < NSEC; s++) AppendMenuW(m, MF_POPUP | MF_STRING, (UINT_PTR)BuildSection(s), titles[s]);
@@ -4821,6 +5360,7 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_MENUSELECT: OnMenuSelect(w, l); return 0;
     case WM_MENURBUTTONUP: OnMenuRButtonUp((int)w, (HMENU)l); return 0;
+    case WM_FAVDONE: if (g_inMenu) g_favDirty = 1; else FlushIconCache(); return 0; /* значок сайта скачан: обновим значки пунктов */
     case WM_APP + 5: ShowSettings(); return 0;
     case WM_DISPLAYCHANGE: SetTimer(h, 9, 700, NULL); return 0;
     case WM_TIMER:
